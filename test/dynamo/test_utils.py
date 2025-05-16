@@ -174,6 +174,7 @@ class TestDynamoTimed(TestCase):
 
         add(torch.rand([10]), torch.rand([10]))
         utils.reset_frame_count()
+        torch._logging._internal.structured_logging_overhead.clear()
 
     @dynamo_config.patch(
         {
@@ -242,6 +243,7 @@ class TestDynamoTimed(TestCase):
  'compile_fx.<locals>.fw_compiler_base': [0.0],
  'compile_fx_inner': [0.0, 0.0],
  'create_aot_dispatcher_function': [0.0],
+ 'fx_codegen_and_compile': [0.0, 0.0],
  'gc': [0.0],
  'min_cut_rematerialization_partition': [0.0]}""",  # noqa: B950
         )
@@ -309,7 +311,6 @@ class TestDynamoTimed(TestCase):
  'compliant_custom_ops': set(),
  'config_inline_inbuilt_nn_modules': False,
  'config_suppress_errors': False,
- 'cuda_synchronize_time_us': None,
  'cuda_version': None,
  'cudagraph_skip_reason': None,
  'distributed_ephemeral_timeout_us': None,
@@ -401,7 +402,6 @@ class TestDynamoTimed(TestCase):
  'compliant_custom_ops': None,
  'config_inline_inbuilt_nn_modules': None,
  'config_suppress_errors': None,
- 'cuda_synchronize_time_us': None,
  'cuda_version': None,
  'cudagraph_skip_reason': None,
  'distributed_ephemeral_timeout_us': None,
