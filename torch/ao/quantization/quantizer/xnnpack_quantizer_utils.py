@@ -1,8 +1,9 @@
 # mypy: allow-untyped-defs
 import itertools
 import typing
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, NamedTuple, Optional
+from typing import NamedTuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -165,9 +166,9 @@ def get_bias_qspec(quantization_config: Optional[QuantizationConfig]):
     if quantization_config.bias is None:
         return None
     quantization_spec: QuantizationSpec = quantization_config.bias
-    assert (
-        quantization_spec.dtype == torch.float
-    ), "Only float dtype for bias is supported for bias right now"
+    assert quantization_spec.dtype == torch.float, (
+        "Only float dtype for bias is supported for bias right now"
+    )
     return quantization_spec
 
 
@@ -375,9 +376,11 @@ def _do_annotate_conv_relu(
             input_qspec_map[bias] = get_bias_qspec(quantization_config)
             partition.append(bias)
 
+        # pyrefly: ignore [bad-argument-type]
         if _is_annotated(partition):
             continue
 
+        # pyrefly: ignore [bad-argument-type]
         if filter_fn and any(not filter_fn(n) for n in partition):
             continue
 
@@ -388,6 +391,7 @@ def _do_annotate_conv_relu(
             output_qspec=get_output_act_qspec(quantization_config),  # type: ignore[arg-type]
             _annotated=True,
         )
+        # pyrefly: ignore [bad-argument-type]
         _mark_nodes_as_annotated(partition)
         annotated_partitions.append(partition)
     return annotated_partitions
@@ -422,7 +426,7 @@ def _annotate_conv_bn(
     filter_fn: Optional[Callable[[Node], bool]] = None,
 ) -> Optional[list[list[Node]]]:
     """
-    Find conv + batchnorm parititions
+    Find conv + batchnorm partitions
     Note: This is only used for QAT. In PTQ, batchnorm should already be fused into the conv.
     """
     return _do_annotate_conv_bn(gm, quantization_config, filter_fn, has_relu=False)
@@ -435,7 +439,7 @@ def _annotate_conv_bn_relu(
     filter_fn: Optional[Callable[[Node], bool]] = None,
 ) -> Optional[list[list[Node]]]:
     """
-    Find conv + batchnorm + relu parititions
+    Find conv + batchnorm + relu partitions
     Note: This is only used for QAT. In PTQ, batchnorm should already be fused into the conv.
     """
     return _do_annotate_conv_bn(gm, quantization_config, filter_fn, has_relu=True)
@@ -448,7 +452,7 @@ def _annotate_conv_transpose_bn(
     filter_fn: Optional[Callable[[Node], bool]] = None,
 ) -> Optional[list[list[Node]]]:
     """
-    Find conv_transpose + batchnorm parititions
+    Find conv_transpose + batchnorm partitions
     Note: This is only used for QAT. In PTQ, batchnorm should already be fused into the conv.
     """
     return _do_annotate_conv_bn(
@@ -463,7 +467,7 @@ def _annotate_conv_transpose_bn_relu(
     filter_fn: Optional[Callable[[Node], bool]] = None,
 ) -> Optional[list[list[Node]]]:
     """
-    Find conv_transpose + batchnorm + relu parititions
+    Find conv_transpose + batchnorm + relu partitions
     Note: This is only used for QAT. In PTQ, batchnorm should already be fused into the conv.
     """
     return _do_annotate_conv_bn(

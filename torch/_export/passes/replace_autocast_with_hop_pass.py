@@ -34,7 +34,7 @@ def _is_enter_autocast_node(node: torch.fx.Node) -> Union[torch.fx.Node, bool]:
     return (
         node
         and node.op == "call_function"
-        and node.target == torch.amp.autocast_mode._enter_autocast
+        and node.target is torch.amp.autocast_mode._enter_autocast
     )
 
 
@@ -42,7 +42,7 @@ def _is_exit_autocast_node(node: torch.fx.Node) -> Union[torch.fx.Node, bool]:
     return (
         node
         and node.op == "call_function"
-        and node.target == torch.amp.autocast_mode._exit_autocast
+        and node.target is torch.amp.autocast_mode._exit_autocast
     )
 
 
@@ -59,7 +59,7 @@ def _is_autocast_sub_mod(node: torch.fx.Node) -> bool:
         if (
             first_non_ph
             and first_non_ph.op == "call_function"
-            and first_non_ph.target == torch.amp.autocast_mode._enter_autocast
+            and first_non_ph.target is torch.amp.autocast_mode._enter_autocast
         ):
             # TODO: check if current auto-cast type is the same as the args of
             # _enter_autocast. If so, return False, i.e. do not create a submodule.
@@ -100,8 +100,8 @@ def _split_autocast(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     split_autocast creates a new graph module that splits the input graph module into multiple submodules
     based on the `_enter_autocast` and `_exit_autocast` nodes. It doesn't mutate the input graph module.
 
-    Nodes between the **outer-most** `_enter_autocast` and `_exit_autocast(_enter_autocast)` are splitted
-    into a submodule. Nested autocast regions are not splitted.
+    Nodes between the **outer-most** `_enter_autocast` and `_exit_autocast(_enter_autocast)` are split
+    into a submodule. Nested autocast regions are not split.
     `_enter_autocast` and `_exit_autocast(_enter_autocast)` nodes are in the submodule as well.
 
     Below is an example of splitting. A, B, C, D, E are blocks of non-autocast nodes in the original graph

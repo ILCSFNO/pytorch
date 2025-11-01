@@ -2,7 +2,6 @@
 import collections
 import functools
 import inspect
-import sys
 import textwrap
 import types
 import warnings
@@ -158,8 +157,6 @@ class SourceContext(torch._C._jit_tree_views.SourceRangeFactory):
 
 
 def get_annotations(obj):
-    if sys.version_info < (3, 10):
-        return getattr(obj, "__annotations__", {})
     # In Python-3.10+ it is recommended to use inspect.get_annotations
     # See https://docs.python.org/3.10/howto/annotations.html
     # But also, in 3.10 annotations from base class are not inherited
@@ -312,7 +309,8 @@ def infer_concrete_type_builder(nn_module, share_types=True):
 
             warnings.warn(
                 f"'{name}' was found in ScriptModule constants, "
-                f" but it is a non-constant {hint}. Consider removing it."
+                f" but it is a non-constant {hint}. Consider removing it.",
+                stacklevel=2,
             )
             continue
         if not hasattr(nn_module, name):
@@ -321,7 +319,8 @@ def infer_concrete_type_builder(nn_module, share_types=True):
             warnings.warn(
                 f"'{name}' was found in ScriptModule constants, "
                 "but was not actually set in __init__. "
-                "Consider removing it."
+                "Consider removing it.",
+                stacklevel=2,
             )
             continue
         value = getattr(nn_module, name)
@@ -371,7 +370,7 @@ def infer_concrete_type_builder(nn_module, share_types=True):
                 hint = (
                     "(This function exists as an attribute on the Python module, "
                     "but we failed to compile it to a TorchScript function. "
-                    f"\nThe error stack is reproduced here:\n{e}"
+                    f"\nThe error stack is reproduced here:\n{e})"
                 )
                 concrete_type_builder.add_failed_attribute(name, hint)
 
@@ -431,7 +430,7 @@ class ConcreteTypeStore:
         self.methods_compiled = set()
 
     def get_or_create_concrete_type(self, nn_module):
-        """Infer a ConcreteType from this `nn.Module` instance. Underlying JIT types are re-used if possible."""
+        """Infer a ConcreteType from this `nn.Module` instance. Underlying JIT types are reused if possible."""
         concrete_type_builder = infer_concrete_type_builder(nn_module)
 
         nn_module_type = type(nn_module)
@@ -502,7 +501,7 @@ def get_module_concrete_type(nn_module, share_types=True):
         # Look into the store of cached JIT types
         concrete_type = concrete_type_store.get_or_create_concrete_type(nn_module)
     else:
-        # Get a concrete type directly, without trying to re-use an existing JIT
+        # Get a concrete type directly, without trying to reuse an existing JIT
         # type from the type store.
         concrete_type_builder = infer_concrete_type_builder(nn_module, share_types)
         concrete_type_builder.set_poisoned()
@@ -588,9 +587,9 @@ def create_script_module_impl(nn_module, concrete_type, stubs_fn):
         #    recursively scripting them.
         for name, sub_concrete_type in concrete_type.get_modules():
             orig_value = getattr(nn_module, name)
-            assert isinstance(
-                orig_value, Module
-            ), f"Expected Module but got {type(orig_value)}"
+            assert isinstance(orig_value, Module), (
+                f"Expected Module but got {type(orig_value)}"
+            )
             module_type = sub_concrete_type.jit_type
             if isinstance(module_type, torch._C.InterfaceType):
                 # use the interface inference rule to compile the module
@@ -750,6 +749,7 @@ def get_overload_annotations(mod, jit_ignored_properties):
             if method_overloads is None:
                 continue
 
+            # pyrefly: ignore [missing-attribute]
             if item.__func__ in method_overloads:
                 raise RuntimeError(
                     _jit_internal.get_overload_no_implementation_error_message(

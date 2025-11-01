@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import copy
 import functools
-import warnings
-from typing import Any, Callable, Optional, TYPE_CHECKING
+import typing_extensions
+from typing import Any, Optional, TYPE_CHECKING
 
 import torch
 import torch._dynamo as torchdynamo
@@ -35,6 +35,8 @@ from torch.fx._compatibility import compatibility
 
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from torch.ao.quantization.qconfig import _ObserverOrFakeQuantizeConstructor
     from torch.fx import Node
 
@@ -238,10 +240,14 @@ def _get_not_module_type_or_name_filter(
 
 
 @compatibility(is_backward_compatible=False)
+@typing_extensions.deprecated(
+    "XNNPACKQuantizer is deprecated! Please use xnnpack quantizer in "
+    "ExecuTorch (https://github.com/pytorch/executorch/tree/main/backends/xnnpack/quantizer) instead."
+)
 class XNNPACKQuantizer(Quantizer):
     """
     !!! DEPRECATED !!!
-    XNNPACKQuantizer is a marked as deprected. It will be removed in the future.
+    XNNPACKQuantizer is a marked as deprecated. It will be removed in the future.
     It has been moved to executorch.backends.xnnpack.quantizer.xnnpack_quantizer.XNNPACKQuantizer.
     Please use the new quantizer instead.
     """
@@ -278,7 +284,6 @@ class XNNPACKQuantizer(Quantizer):
 
     def __init__(self) -> None:
         super().__init__()
-        warnings.warn(f"{self.__class__.__name__} is deprecated!")
         self.global_config: Optional[QuantizationConfig] = None
         self.operator_type_config: dict[
             torch._ops.OpOverloadPacket, Optional[QuantizationConfig]
@@ -342,9 +347,9 @@ class XNNPACKQuantizer(Quantizer):
         quantizer.set_module_name("blocks.sub"), it will quantize all supported operator/operator
         patterns in the submodule with this module name with the given `quantization_config`
         """
-        assert (
-            quantization_config is not None
-        ), " quantization_config == None is not supported yet"
+        assert quantization_config is not None, (
+            " quantization_config == None is not supported yet"
+        )
         self.module_name_config[module_name] = quantization_config
         return self
 

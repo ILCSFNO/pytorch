@@ -3,7 +3,8 @@ import json
 import os
 import tempfile
 import unittest
-from typing import Callable, Optional
+from collections.abc import Callable
+from typing import Optional
 
 import torch
 import torch._inductor.test_case
@@ -12,7 +13,7 @@ from torch import _dynamo as torchdynamo
 from torch._inductor import config
 from torch.profiler import ProfilerActivity
 from torch.testing._internal.common_utils import TemporaryFileName
-from torch.testing._internal.inductor_utils import HAS_CUDA, IS_BIG_GPU
+from torch.testing._internal.inductor_utils import HAS_CUDA_AND_TRITON, IS_BIG_GPU
 from torch.torch_version import TorchVersion
 from torch.utils._triton import has_triton
 
@@ -185,6 +186,8 @@ class DynamoProfilerTests(torch._inductor.test_case.TestCase):
     def test_inductor_profiling_triton_hooks(self):
         from triton.compiler import CompiledKernel  # @manual
 
+        from torch._inductor.runtime.triton_compat import knobs
+
         hooks_called = {"enter": False, "exit": False}
 
         def launch_enter_hook(lazy_dict):
@@ -193,8 +196,12 @@ class DynamoProfilerTests(torch._inductor.test_case.TestCase):
         def launch_exit_hook(lazy_dict):
             hooks_called["exit"] = True
 
-        CompiledKernel.launch_enter_hook = launch_enter_hook
-        CompiledKernel.launch_exit_hook = launch_exit_hook
+        if knobs:
+            knobs.runtime.launch_enter_hook = launch_enter_hook
+            knobs.runtime.launch_exit_hook = launch_exit_hook
+        else:
+            CompiledKernel.launch_enter_hook = launch_enter_hook
+            CompiledKernel.launch_exit_hook = launch_exit_hook
 
         def fn(x, y):
             return torch._foreach_add(x, y)
@@ -238,7 +245,7 @@ class DynamoProfilerTests(torch._inductor.test_case.TestCase):
                 skip_first=3, wait=1, warmup=1, active=2, repeat=1
             ),
         ) as prof:
-            for idx in range(10):
+            for _ in range(10):
                 fn(*inputs)
                 prof.step()
 
@@ -307,5 +314,5 @@ class DynamoProfilerTests(torch._inductor.test_case.TestCase):
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests
 
-    if HAS_CUDA:
+    if HAS_CUDA_AND_TRITON:
         run_tests()

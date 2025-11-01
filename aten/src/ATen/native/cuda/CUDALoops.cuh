@@ -226,9 +226,16 @@ C10_LAUNCH_BOUNDS_1(num_threads())
 __global__ void vectorized_elementwise_kernel(int N, func_t f, array_t data) {
   using traits = function_traits<func_t>;
   constexpr auto io_size = calc_io_size<func_t>();
-  int remaining = N - io_block_work_size<io_size>() * blockIdx.x;
+#if defined(USE_ROCM) && defined(__gfx942__)
+  // Similar check in launch_vectorized_kernel() as well. Both should be in sync.
+  constexpr int tws = 16;
+#else
+  constexpr int tws = elems_per_thread<io_size>();
+#endif
+  constexpr int bws = tws * num_threads();
+  int remaining = N - bws * blockIdx.x;
 
-  if (remaining < io_block_work_size<io_size>()) { // if this block handles the reminder,
+  if (remaining < bws) { // if this block handles the reminder,
                                        // just do a naive unrolled loop
     auto input_calc = TrivialOffsetCalculator<traits::arity>();
     auto output_calc = TrivialOffsetCalculator<1>();
@@ -240,14 +247,14 @@ __global__ void vectorized_elementwise_kernel(int N, func_t f, array_t data) {
         decltype(output_calc),
         memory::LoadWithoutCast,
         memory::StoreWithoutCast,
-        elems_per_thread<io_size>()>(
+        tws>(
         data, remaining, input_calc, output_calc, loader, storer);
     elementwise_kernel_helper(f, policy);
   } else { // if this block has a full `block_work_size` data to handle, use
            // vectorized memory access
     constexpr auto optimal_vec_size = calc_optimal_vec_size<vec_size, io_size>();
     elementwise_kernel_helper(
-        f, memory::policies::vectorized<optimal_vec_size, array_t, elems_per_thread<io_size>()>(data));
+        f, memory::policies::vectorized<optimal_vec_size, array_t, tws>(data));
   }
 }
 #endif // USE_ROCM
@@ -285,10 +292,13 @@ static inline void launch_vectorized_kernel(
   TORCH_INTERNAL_ASSERT(N > 0 && N <= std::numeric_limits<int32_t>::max());
   using traits = function_traits<func_t>;
   constexpr auto io_size = calc_io_size<func_t>();
-  int64_t grid = (N + io_block_work_size<io_size>() - 1) / io_block_work_size<io_size>();
   auto stream = at::cuda::getCurrentCUDAStream();
 #ifdef USE_ROCM
   int vec_size = memory::can_vectorize_up_to<func_t>(data);
+  c10::DeviceIndex curDevice = -1;
+  AT_CUDA_CHECK(c10::cuda::GetDevice(&curDevice));
+  // Similar check in vectorized_elementwise_kernel() as well. Both should be in sync.
+  int tws = at::detail::getCUDAHooks().isGPUArch({"gfx942"}, curDevice) ? 16 : elems_per_thread<io_size>();
 #else
   using cpp_type = typename function_traits<func_t>::result_type;
   const uint16_t max_vec_size = memory::can_vectorize_up_to<func_t>(data);
@@ -305,7 +315,10 @@ static inline void launch_vectorized_kernel(
   if constexpr (sizeof(cpp_type) < 2) {
     vec_size = std::min<uint16_t>(vec_size, 4);
   }
+  int tws = elems_per_thread<io_size>();
 #endif
+  int bws = tws * num_threads();
+  int64_t grid = (N + bws - 1) / bws;
   switch (vec_size) {
 #ifdef USE_ROCM
     case 16:
@@ -334,8 +347,9 @@ static inline void launch_vectorized_kernel(
       auto output_calc = TrivialOffsetCalculator<1>();
       auto loader = memory::LoadWithoutCast();
       auto storer = memory::StoreWithoutCast();
-      unrolled_elementwise_kernel<func_t, array_t, elems_per_thread<io_size>()>
-          <<<grid, num_threads(), 0, stream>>>(
+      int64_t grid_unrolled = (N + elementwise_block_work_size() - 1) / elementwise_block_work_size();
+      unrolled_elementwise_kernel<func_t, array_t, elementwise_thread_work_size()>
+          <<<grid_unrolled, num_threads(), 0, stream>>>(
               N, f, data, input_calc, output_calc, loader, storer);
       C10_CUDA_KERNEL_LAUNCH_CHECK();
       break;
@@ -422,7 +436,6 @@ static inline void launch_vectorized_templated_kernel(
     loader_t l,
     storer_t s) {
   TORCH_INTERNAL_ASSERT(N > 0 && N <= std::numeric_limits<int32_t>::max());
-  using traits = function_traits<func_t>;
   int64_t grid = (N + vectorized_templated_config::block_work_size() - 1) /
       vectorized_templated_config::block_work_size();
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -843,9 +856,13 @@ struct type_specialized_kernel_launcher {
       out_calc_t output_offset_calculator,
       loader_t loader,
       storer_t storer) {
-    if (ret_t == rt_binary_specializations[arg_index][0] &&
-        arg0_t == rt_binary_specializations[arg_index][1] &&
-        arg1_t == rt_binary_specializations[arg_index][2])
+    constexpr ScalarType sret_t = rt_binary_specializations[arg_index][0];
+    constexpr ScalarType sarg0_t = rt_binary_specializations[arg_index][1];
+    constexpr ScalarType sarg1_t = rt_binary_specializations[arg_index][2];
+    if (ret_t == sret_t && arg0_t == sarg0_t && arg1_t == sarg1_t) {
+      using cret_t = c10::impl::ScalarTypeToCPPTypeT<sret_t>;
+      using carg0_t = c10::impl::ScalarTypeToCPPTypeT<sarg0_t>;
+      using carg1_t = c10::impl::ScalarTypeToCPPTypeT<sarg1_t>;
       launch_vectorized_templated_kernel<
           func_t,
           array_t,
@@ -853,12 +870,9 @@ struct type_specialized_kernel_launcher {
           out_calc_t,
           loader_t,
           storer_t,
-          decltype(c10::impl::ScalarTypeToCPPType<
-                   rt_binary_specializations[arg_index][0]>::t),
-          decltype(c10::impl::ScalarTypeToCPPType<
-                   rt_binary_specializations[arg_index][1]>::t),
-          decltype(c10::impl::ScalarTypeToCPPType<
-                   rt_binary_specializations[arg_index][2]>::t)>(
+          cret_t,
+          carg0_t,
+          carg1_t>(
           numel,
           f,
           data,
@@ -866,6 +880,7 @@ struct type_specialized_kernel_launcher {
           output_offset_calculator,
           loader,
           storer);
+    }
   }
 };
 
@@ -986,12 +1001,41 @@ void gpu_kernel_impl(TensorIteratorBase& iter, const func_t& f) {
       dtypes[i] = iter.dtype(i);
     }
     auto offset_calc = ::make_offset_calculator<traits::arity + 1>(iter);
+#ifdef USE_ROCM
+    constexpr int grp_sz = 128;
+    launch_legacy_kernel_manual_unroll<grp_sz, 4>(numel, [=] GPU_LAMBDA(int idx, bool unrl) {
+      if (unrl) {
+        auto offsets0 = offset_calc.get(idx);
+        auto offsets1 = offset_calc.get(idx + grp_sz);
+        auto offsets2 = offset_calc.get(idx + grp_sz * 2);
+        auto offsets3 = offset_calc.get(idx + grp_sz * 3);
+        void* out0 = data[0] + offsets0[0];
+        void* out1 = data[0] + offsets1[0];
+        void* out2 = data[0] + offsets2[0];
+        void* out3 = data[0] + offsets3[0];
+        arg0_t result0 = invoke(f, &data[1], &offsets0[1], &dtypes[1], 1);
+        arg0_t result1 = invoke(f, &data[1], &offsets1[1], &dtypes[1], 1);
+        arg0_t result2 = invoke(f, &data[1], &offsets2[1], &dtypes[1], 1);
+        arg0_t result3 = invoke(f, &data[1], &offsets3[1], &dtypes[1], 1);
+        c10::cast_and_store<arg0_t>(dtypes[0], out0, result0);
+        c10::cast_and_store<arg0_t>(dtypes[0], out1, result1);
+        c10::cast_and_store<arg0_t>(dtypes[0], out2, result2);
+        c10::cast_and_store<arg0_t>(dtypes[0], out3, result3);
+      } else {
+        auto offsets = offset_calc.get(idx);
+        void* out = data[0] + offsets[0];
+        arg0_t result = invoke(f, &data[1], &offsets[1], &dtypes[1], 1);
+        c10::cast_and_store<arg0_t>(dtypes[0], out, result);
+      }
+    });
+#else
     launch_legacy_kernel<128, 4>(numel, [=] GPU_LAMBDA(int idx) {
       auto offsets = offset_calc.get(idx);
       void* out = data[0] + offsets[0];
       arg0_t result = invoke(f, &data[1], &offsets[1], &dtypes[1], 1);
       c10::cast_and_store<arg0_t>(dtypes[0], out, result);
     });
+#endif
   }
 }
 

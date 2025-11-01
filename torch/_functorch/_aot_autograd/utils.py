@@ -4,11 +4,14 @@ Contains various utils for AOTAutograd, including those for handling collections
 """
 
 import dataclasses
+import logging
 import operator
 import warnings
+from collections.abc import Callable
 from contextlib import nullcontext
 from functools import wraps
-from typing import Any, Callable, Optional, Union
+from typing import Any, Optional, TypeVar, Union
+from typing_extensions import ParamSpec
 
 import torch
 import torch.utils._pytree as pytree
@@ -18,6 +21,8 @@ from torch._subclasses.fake_tensor import FakeTensor
 from torch._subclasses.functional_tensor import FunctionalTensor
 from torch.fx.experimental._backward_state import BackwardState
 from torch.fx.experimental.proxy_tensor import py_sym_types
+
+from .descriptors import AOTOutput
 
 
 KNOWN_TYPES = [
@@ -36,6 +41,7 @@ KNOWN_TYPES = [
 original_zip = zip
 
 aot_graphs_effects_log = getArtifactLogger(__name__, "aot_graphs_effects")
+annotation_log = getArtifactLogger(__name__, "annotation")
 
 
 def strict_zip(*iterables, strict=True, **kwargs):
@@ -96,6 +102,7 @@ def _get_autocast_states():
 
 
 def make_boxed_func(f):
+    @simple_wraps(f)
     def g(args):
         return f(*args)
 
@@ -130,7 +137,8 @@ def call_func_at_runtime_with_args(
             warnings.warn(
                 "Your compiler for AOTAutograd is returning a function that doesn't take boxed arguments. "
                 "Please wrap it with functorch.compile.make_boxed_func or handle the boxed arguments yourself. "
-                "See https://github.com/pytorch/pytorch/pull/83137#issuecomment-1211320670 for rationale."
+                "See https://github.com/pytorch/pytorch/pull/83137#issuecomment-1211320670 for rationale.",
+                stacklevel=2,
             )
             out = normalize_as_list(f(*args))
     return out
@@ -140,9 +148,9 @@ def call_func_at_runtime_with_args(
 class PytreeThunk:
     spec: Optional[pytree.TreeSpec] = None
     # These are some kinda dumb microoptimizations that save about 3-4 us of overhead.
-    is_simple: Optional[
-        bool
-    ] = None  # if the output spec is a tuple/list, we won't bother unflattening it.
+    is_simple: Optional[bool] = (
+        None  # if the output spec is a tuple/list, we won't bother unflattening it.
+    )
     is_really_simple: Optional[bool] = None  # if the output spec is a LeafSpec
 
     def set(self, spec: pytree.TreeSpec) -> None:
@@ -150,7 +158,7 @@ class PytreeThunk:
         assert spec is not None
         self.spec: pytree.TreeSpec = spec
         if self.spec.type in {tuple, list} and all(
-            child.is_leaf() for child in spec.children_specs
+            child.is_leaf() for child in spec.children()
         ):
             self.is_simple = True
         if self.spec.is_leaf():
@@ -241,7 +249,7 @@ def maybe_to_fresh_input(idx, t, meta):
 def is_with_effects(node):
     return (
         node.op == "call_function"
-        and node.target == torch.ops.higher_order.with_effects
+        and node.target is torch.ops.higher_order.with_effects
     )
 
 
@@ -323,6 +331,7 @@ def unlift_tokens(fw_module, fw_metadata, aot_config, bw_module=None):
                         and out.args[1] == 0
                         and out.args[0] in with_effect_nodes
                     ):
+                        # pyrefly: ignore [missing-attribute]
                         output_token_nodes.append(out)
                     else:
                         other_output_nodes.append(out)
@@ -335,12 +344,12 @@ def unlift_tokens(fw_module, fw_metadata, aot_config, bw_module=None):
 
         num_erased_inputs = len(input_token_nodes)
 
-        assert (
-            num_erased_inputs == expected_num_erased
-        ), f"{subgraph} num_erased_inputs:{num_erased_inputs} {input_token_nodes}!=expected {expected_num_erased}"
-        assert (
-            num_erased_outs == expected_num_erased
-        ), f"{subgraph} num_erased_outs:{num_erased_outs} {output_token_nodes}!=expected {expected_num_erased}"
+        assert num_erased_inputs == expected_num_erased, (
+            f"{subgraph} num_erased_inputs:{num_erased_inputs} {input_token_nodes}!=expected {expected_num_erased}"
+        )
+        assert num_erased_outs == expected_num_erased, (
+            f"{subgraph} num_erased_outs:{num_erased_outs} {output_token_nodes}!=expected {expected_num_erased}"
+        )
 
         module.recompile()
 
@@ -398,34 +407,28 @@ def root_module_when_exporting_non_strict(flat_fn):
         return None
 
 
-def copy_fwd_metadata_to_bw_nodes(fx_g):
-    """
-    Input: `fx_g` which contains the joint fwd+bwd FX graph created by
-    aot_autograd.
+def _is_forward_node_with_seq_nr(node: torch.fx.Node) -> bool:
+    # For now, assume that if nn_module_stack_metadata is populated, this
+    # node is from the forward. Ignore nodes without `seq_nr`.
+    # TODO(future): there is likely a less brittle way to do this by walking
+    # the descendants of graph inputs corresponding to fwd inputs, didn't
+    # seem obvious at first glance on how to partition graph inputs into
+    # fwd vs bwd without relying on string names.
+    return node.meta.get("partitioner_tag") != "is_backward" and "seq_nr" in node.meta
 
-    This function walks the graph and copies over metadata from forward nodes
-    to backward nodes, using the `seq_nr` field as a one-to-many mapping
-    from forward node to backward node. This metadata is useful for performance
-    profiling and debugging.
-    """
 
-    def _is_forward_node_with_seq_nr(node):
-        # For now, assume that if nn_module_stack_metadata is populated, this
-        # node is from the forward. Ignore nodes without `seq_nr`.
-        # TODO(future): there is likely a less brittle way to do this by walking
-        # the descendants of graph inputs corresponding to fwd inputs, didn't
-        # seem obvious at first glance on how to partition graph inputs into
-        # fwd vs bwd without relying on string names.
-        return "nn_module_stack" in node.meta and "seq_nr" in node.meta
+def _is_backward_node_with_seq_nr(node: torch.fx.Node) -> bool:
+    # For now, assume that if nn_module_stack_metadata is not populated,
+    # this node is from the backward. Ignore nodes without `seq_nr`.
+    # TODO(future): there is likely a less brittle way to do this, same
+    # as with the forward.
+    return node.meta.get("partitioner_tag") == "is_backward" and "seq_nr" in node.meta
 
-    def _is_backward_node_with_seq_nr(node):
-        # For now, assume that if nn_module_stack_metadata is not populated,
-        # this node is from the backward. Ignore nodes without `seq_nr`.
-        # TODO(future): there is likely a less brittle way to do this, same
-        # as with the forward.
-        return ("nn_module_stack" not in node.meta) and "seq_nr" in node.meta
 
-    fwd_seq_nr_to_node = {}
+def _collect_fwd_nodes_from_subgraph(
+    fx_g: torch.fx.GraphModule, fwd_seq_nr_to_node: dict[str, torch.fx.Node]
+) -> None:
+    """Collect forward nodes from a single subgraph into the global mapping."""
     for node in fx_g.graph.nodes:
         if not _is_forward_node_with_seq_nr(node):
             continue
@@ -435,16 +438,62 @@ def copy_fwd_metadata_to_bw_nodes(fx_g):
             # that the current op did not create an autograd node, and there
             # is no corresponding backward node, so we skip.
             continue
-        fwd_seq_nr_to_node[node.meta["seq_nr"]] = node
+        fwd_seq_nr_to_node[seq_nr] = node
 
+
+def _copy_metadata_to_bw_nodes_in_subgraph(
+    fx_g: torch.fx.GraphModule, fwd_seq_nr_to_node: dict[str, torch.fx.Node]
+) -> None:
+    """Copy metadata from forward nodes to backward nodes in a single subgraph."""
     for node in fx_g.graph.nodes:
+        annotation_log.debug("node: %s", node.name)
+        seq_nr = node.meta.get("seq_nr")
+        annotation_log.debug("seq_nr: %s", seq_nr)
+
         if not _is_backward_node_with_seq_nr(node):
             continue
+
         # fwd_node should always exist, but handle non-existence just in case
         fwd_node = fwd_seq_nr_to_node.get(node.meta["seq_nr"])
         if fwd_node is not None:
-            node.meta["fwd_nn_module_stack"] = fwd_node.meta["nn_module_stack"]
+            node.meta["fwd_nn_module_stack"] = fwd_node.meta.get("nn_module_stack")
             node.meta["fwd_source_fn_stack"] = fwd_node.meta.get("source_fn_stack")
+            # TODO: better to change to a specific field of custom?
+            node.meta["custom"] = fwd_node.meta.get("custom")
+
+
+def copy_fwd_metadata_to_bw_nodes(fx_g: torch.fx.GraphModule) -> None:
+    """
+    Input: `fx_g` which contains the joint fwd+bwd FX graph created by
+    aot_autograd.
+
+    This function walks the graph and copies over metadata from forward nodes
+    to backward nodes, using the `seq_nr` field as a one-to-many mapping
+    from forward node to backward node. This metadata is useful for performance
+    profiling and debugging.
+
+    This function supports matching forward and backward nodes across different
+    subgraphs (e.g., in recursive submodules from HOPs), enabling backward nodes
+    in any submodule to match forward nodes in any submodule.
+    """
+
+    # Build a global mapping of seq_nr to forward nodes across all subgraphs
+    fwd_seq_nr_to_node: dict[str, torch.fx.Node] = {}
+
+    # First pass: collect all forward nodes from all subgraphs
+    for submod in fx_g.modules():
+        if isinstance(submod, torch.fx.GraphModule):
+            _collect_fwd_nodes_from_subgraph(submod, fwd_seq_nr_to_node)
+
+    if annotation_log.isEnabledFor(logging.DEBUG):
+        for k, v in fwd_seq_nr_to_node.items():
+            annotation_log.debug("forward:: key: %s, value: %s", k, v)
+
+    # Second pass: copy metadata to backward nodes in all subgraphs
+    # using the global forward mapping
+    for submod in fx_g.modules():
+        if isinstance(submod, torch.fx.GraphModule):
+            _copy_metadata_to_bw_nodes_in_subgraph(submod, fwd_seq_nr_to_node)
 
 
 def register_buffer_assignment_hook(mod, assigned_buffers):
@@ -500,3 +549,82 @@ def get_cuda_generator_meta_val(device_idx: int):
     it is fine to use in the meta.
     """
     return torch.cuda.default_generators[device_idx].clone_state()
+
+
+def top_saved_tensors_hooks():
+    return torch._C._autograd._top_saved_tensors_default_hooks(True)
+
+
+def saved_tensors_hooks_are_inlineable(hooks) -> bool:
+    if not hooks:
+        return False
+    pack, unpack = hooks
+    return isinstance(pack, torch.fx.GraphModule) and isinstance(
+        unpack, torch.fx.GraphModule
+    )
+
+
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+_S = TypeVar("_S")
+
+
+def without_output_descs(f: Callable[_P, tuple[_T, _S]]) -> Callable[_P, _T]:
+    @wraps(f)
+    @simple_wraps(f)
+    def inner(*args, **kwargs):
+        # pyrefly: ignore [invalid-param-spec]
+        return f(*args, **kwargs)[0]
+
+    # pyrefly: ignore [bad-return]
+    return inner
+
+
+_P2 = ParamSpec("_P2")
+_R = TypeVar("_R")
+_R2 = TypeVar("_R2")
+
+
+def simple_wraps(
+    f: Callable[_P, _R],
+) -> Callable[[Callable[_P2, _R2]], Callable[_P2, _R2]]:
+    # NB: omit ('__module__', '__name__', '__qualname__') for ease of
+    # debugging
+    return wraps(f, assigned=("__doc__", "__annotations__", "__type_params__"))
+
+
+def call_and_expect_output_descs(fn, args):
+    outs_pair = fn(*args)
+    assert isinstance(outs_pair, tuple) and len(outs_pair) == 2, (fn, outs_pair)
+    outs, outs_descs = outs_pair
+    # The Tensor tests protects against the test when there are no outputs
+    out_vals, out_spec = pytree.tree_flatten(outs)
+    out_desc_vals, out_desc_spec = pytree.tree_flatten(outs_descs)
+    assert out_spec == out_desc_spec, (
+        fn_wrappers(fn),
+        outs,
+        outs_descs,
+        out_spec,
+        out_desc_spec,
+    )
+    assert not any(isinstance(x, AOTOutput) for x in out_vals), (
+        fn_wrappers(fn),
+        outs,
+        outs_descs,
+        out_vals,
+    )
+    assert all(
+        isinstance(d, AOTOutput)
+        for (x, d) in zip(out_vals, out_desc_vals)
+        if isinstance(x, (torch.Tensor, torch.SymInt)) or type(x) is int
+    ), (fn_wrappers(fn), outs, outs_descs, out_vals, out_desc_vals)
+    return outs_pair
+
+
+def fn_wrappers(fn):
+    fns = [fn]
+    f = fn
+    while hasattr(f, "__wrapped__"):
+        f = f.__wrapped__
+        fns.append(f)
+    return fns

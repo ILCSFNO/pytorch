@@ -275,7 +275,7 @@ class LocalElasticAgent(SimpleElasticAgent):
         event = events.Event(
             name=name, source=events.EventSource.AGENT, metadata=metadata
         )
-        events.record(event)
+        events.record(event, self._worker_group.spec.event_log_handler)
 
     # pyre-fixme[56]: Pyre was not able to infer the type of the decorator
     #  `torch.distributed.elastic.metrics.prof`.
@@ -333,8 +333,10 @@ class LocalElasticAgent(SimpleElasticAgent):
                     rank=worker.global_rank,
                     local_rank=local_rank,
                 )
+                # pyrefly: ignore [unsupported-operation]
                 log_line_prefixes[local_rank] = log_line_prefix
 
+            # pyrefly: ignore [unsupported-operation]
             envs[local_rank] = worker_env
             worker_args = list(spec.args)
             worker_args = macros.substitute(worker_args, str(local_rank))
@@ -353,6 +355,9 @@ class LocalElasticAgent(SimpleElasticAgent):
             logs_specs=self._logs_specs,
             log_line_prefixes=log_line_prefixes,
             start_method=self._start_method,
+            numa_options=spec.numa_options,
+            duplicate_stdout_filters=spec.duplicate_stdout_filters,
+            duplicate_stderr_filters=spec.duplicate_stderr_filters,
         )
 
         return self._pcontext.pids()

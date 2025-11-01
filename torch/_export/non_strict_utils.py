@@ -6,9 +6,9 @@ import inspect
 import logging
 import math
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
-from typing import Any, Callable, Optional, TYPE_CHECKING, Union
+from typing import Any, Optional, TYPE_CHECKING, Union
 
 import torch
 import torch.utils._pytree as pytree
@@ -68,11 +68,79 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-def key_path_to_source(kp: KeyPath) -> Source:
+class _KeyPath:
+    """
+    Wraps `KeyPath` to aid `isinstance` checks.
+    """
+
+    def __init__(self, kp: KeyPath):
+        self.kp = kp
+
+
+class _KeyPathTrie:
+    """
+    Builds a trie of `KeyPath` prefixes mapping to `Source` leaves.
+    """
+
+    def __init__(self):
+        self.root = {}
+
+    def add(self, kp: KeyPath, src: Source):
+        assert len(kp) > 0
+        *path, leaf = kp
+        node = self.root
+        for k in path:
+            if k not in node:
+                node[k] = {}
+            node = node[k]
+        node[leaf] = src
+
+    def get(self, kp: KeyPath) -> tuple[Source, KeyPath]:
+        node = self.root
+        while not isinstance(node, Source):
+            assert len(kp) > 0
+            k, *kp = kp  # type: ignore[assignment]
+            node = node[k]
+        # pyrefly: ignore [bad-return]
+        return node, kp
+
+
+def make_sourced_prefixes(nn_module, args, kwargs) -> _KeyPathTrie:
+    kp_args, kp_kwargs = tree_map_with_path(
+        lambda kp, _: _KeyPath(kp),
+        (tuple(None for _ in args), {k: None for k in kwargs}),  # noqa: C420
+    )
+    kp_combined_args = _combine_args(nn_module, kp_args, kp_kwargs)
+
+    sourced_prefixes = _KeyPathTrie()
+    for name, struct in kp_combined_args.items():
+        src = LocalSource(name)
+
+        if isinstance(struct, _KeyPath):
+            sourced_prefixes.add(struct.kp, src)
+        elif isinstance(struct, tuple):
+            for i, prefix in enumerate(struct):
+                assert isinstance(prefix, _KeyPath)
+                sourced_prefixes.add(prefix.kp, GetItemSource(src, i))
+        elif isinstance(struct, dict):
+            for k, prefix in struct.items():
+                assert isinstance(prefix, _KeyPath)
+                sourced_prefixes.add(prefix.kp, GetItemSource(src, k))
+
+    return sourced_prefixes
+
+
+def key_path_to_source(
+    kp: KeyPath, sourced_prefixes: Optional[_KeyPathTrie] = None
+) -> Source:
     """
     Given a key path, return the source for the key path.
     """
-    source: Source = LocalSource("args")
+    if sourced_prefixes is None:
+        source: Source = LocalSource("args")
+    else:
+        source, kp = sourced_prefixes.get(kp)
+
     for k in kp:
         if isinstance(k, SequenceKey):
             source = GetItemSource(source, k.idx)
@@ -96,13 +164,17 @@ def fakify(
     t: Any,
     t_constraints: dict[int, dict[int, Constraint]],
     sources: dict[tuple[int, int], list[Source]],
+    sourced_prefixes: Optional[_KeyPathTrie] = None,
 ):
-    source = key_path_to_source(kp)
+    source = key_path_to_source(kp, sourced_prefixes=sourced_prefixes)
     if _is_constant_argument(t) or isinstance(t, (torch.ScriptObject, torch.nn.Module)):
         return t
 
     if isinstance(t, _IntWrapper):
-        if t.dynamism is not None and t.dynamism.type in (_DimHintType.DYNAMIC, _DimHintType.AUTO):  # type: ignore[union-attr]
+        if t.dynamism is not None and t.dynamism.type in (  # type: ignore[union-attr]
+            _DimHintType.DYNAMIC,
+            _DimHintType.AUTO,
+        ):
             symint = mode.shape_env.create_unspecified_symint_and_symbol(  # type: ignore[union-attr]
                 t.val, source, DimDynamic.DYNAMIC
             )
@@ -129,9 +201,31 @@ def fakify(
             "To register a constant input, use torch.utils._pytree.register_constant"
         )
 
+    # Create symbolic context (handles subclass recursion internally)
+    symbolic_context = _create_symbolic_context_for_tensor(
+        t, source, t_constraints, sources, mode
+    )
+
+    fake = mode.from_tensor(t, source=source, symbolic_context=symbolic_context)
+    mode.shape_env.tracked_fakes.append(TrackedFake(fake, source, symbolic_context))  # type: ignore[union-attr]
+    return fake
+
+
+def _create_symbolic_context_for_tensor(t, source, t_constraints, sources, mode):
+    """Helper function to create symbolic context for a tensor."""
+    from torch._dynamo.source import AttrSource
+    from torch.fx.experimental.symbolic_shapes import (
+        DimDynamic,
+        RelaxedUnspecConstraint,
+        SubclassSymbolicContext,
+    )
+    from torch.utils._python_dispatch import is_traceable_wrapper_subclass
+
+    # Common dynamic dimension logic for both regular tensors and subclasses
     n_dims = len(t.shape)
     dynamic_sizes = []
     constraint_sizes = [None] * n_dims
+
     for i in range(n_dims):
         if i in getattr(t, "_dynamo_weak_dynamic_indices", {}):
             dynamic_sizes.append(DimDynamic.DYNAMIC)
@@ -143,10 +237,38 @@ def fakify(
             constraint_sizes[i] = RelaxedUnspecConstraint(warn_only=False)  # type: ignore[call-overload]
         else:
             dynamic_sizes.append(DimDynamic.STATIC)
-    symbolic_context = StatelessSymbolicContext(
-        dynamic_sizes=dynamic_sizes,
-        constraint_sizes=constraint_sizes,  # type: ignore[arg-type]
-    )
+
+    # Handle nested subclasses
+    if is_traceable_wrapper_subclass(t):
+        # Get inner contexts recursively
+        inner_contexts = {}
+        attrs, _ = type(t).__tensor_flatten__(t)
+
+        # Propagate outer tensor constraints to inner tensors if not already present
+        for attr in attrs:
+            inner_tensor = getattr(t, attr)
+            inner_source = AttrSource(source, attr)
+            inner_contexts[attr] = _create_symbolic_context_for_tensor(
+                inner_tensor, inner_source, t_constraints, sources, mode
+            )
+
+        symbolic_context = SubclassSymbolicContext(
+            dynamic_sizes=dynamic_sizes,
+            constraint_sizes=constraint_sizes,  # type: ignore[arg-type]
+            view_base_context=None,
+            tensor_source=source,
+            shape_env_to_source_to_symbol_cache={},
+            inner_contexts=inner_contexts,
+        )
+    else:
+        symbolic_context: StatelessSymbolicContext = (  # type: ignore[no-redef]
+            StatelessSymbolicContext(
+                dynamic_sizes=dynamic_sizes,
+                constraint_sizes=constraint_sizes,  # type: ignore[arg-type]
+            )
+        )
+
+    # Apply constraints (common logic)
     t_id = id(t)
     assert mode.shape_env is not None
     if t_id in t_constraints:
@@ -157,9 +279,8 @@ def fakify(
                 continue
             symbolic_context.constraint_sizes[i] = constraint.constraint_range
             mode.shape_env.source_name_to_debug_name[src.name()] = constraint.name  # type: ignore[assignment]
-    fake = mode.from_tensor(t, source=source, symbolic_context=symbolic_context)
-    mode.shape_env.tracked_fakes.append(TrackedFake(fake, source, symbolic_context))  # type: ignore[union-attr]
-    return fake
+
+    return symbolic_context
 
 
 def _is_unbacked_symint(symbol):
@@ -235,10 +356,12 @@ def _override_builtin_ops():
     original_min = builtins.min
     original_pow = math.pow
 
+    # pyrefly: ignore [bad-assignment]
     builtins.max = functools.partial(
         _tensor_min_max, real_callable=original_max, tensor_callable=torch.maximum
     )
 
+    # pyrefly: ignore [bad-assignment]
     builtins.min = functools.partial(
         _tensor_min_max, real_callable=original_min, tensor_callable=torch.minimum
     )
@@ -258,8 +381,7 @@ def make_fake_inputs(
     args,
     kwargs,
     dynamic_shapes,
-    _is_torch_jit_trace=False,
-    allow_complex_guards_as_runtime_asserts=False,
+    prefer_deferred_runtime_asserts_over_guards=False,
 ):
     """
     Given an nn module, example inputs, and constraints, return a new fake mode,
@@ -294,7 +416,8 @@ def make_fake_inputs(
         # a toplevel TracingContext with a fake mode, so we do not want to
         # create another fake mode.
         fake_mode = context.fake_mode
-    elif not _is_torch_jit_trace:
+        assert fake_mode is not None
+    else:
         if isinstance(nn_module.forward, functools.partial):
             # functools handles nesting by itself, no need to recurse
             code = nn_module.forward.func.__code__
@@ -310,23 +433,11 @@ def make_fake_inputs(
                 shape_env=ShapeEnv(
                     tracked_fakes=[],
                     co_fields=co_fields,
-                    prefer_deferred_runtime_asserts_over_guards=True,
-                    allow_complex_guards_as_runtime_asserts=allow_complex_guards_as_runtime_asserts,
+                    prefer_deferred_runtime_asserts_over_guards=prefer_deferred_runtime_asserts_over_guards,
                     trace_asserts=True,
                 ),
                 allow_non_fake_inputs=True,
                 export=True,
-            )
-    else:
-        with _config.patch(fake_tensor_allow_unsafe_data_ptr_access=False):
-            fake_mode = FakeTensorMode(
-                shape_env=ShapeEnv(
-                    tracked_fakes=[],
-                    prefer_deferred_runtime_asserts_over_guards=True,
-                    allow_complex_guards_as_runtime_asserts=allow_complex_guards_as_runtime_asserts,
-                    trace_asserts=True,
-                ),
-                allow_non_fake_inputs=True,
             )
     if fake_mode.shape_env is None or fake_mode.shape_env.tracked_fakes is None:
         raise ValueError(
@@ -336,14 +447,18 @@ def make_fake_inputs(
         )
 
     with fake_mode:
-        # FIXME(ycao) ScriptMethod doesn't have signature, I am using an empty one to unblock
-        if not _is_torch_jit_trace:
-            original_signature = inspect.signature(nn_module.forward)
-        else:
-            original_signature = None
+        original_signature = inspect.signature(nn_module.forward)
         sources: dict[tuple[int, int], list[Source]] = defaultdict(list)
+        sourced_prefixes = make_sourced_prefixes(nn_module, args, kwargs)
         fake_args, fake_kwargs = tree_map_with_path(
-            lambda kp, val: fakify(fake_mode, kp, val, t_constraints, sources),
+            lambda kp, val: fakify(
+                fake_mode,
+                kp,
+                val,
+                t_constraints,
+                sources,
+                sourced_prefixes=sourced_prefixes,
+            ),
             (args, kwargs),
         )
 
@@ -413,7 +528,6 @@ def produce_guards_and_solve_constraints(
     dynamic_shapes: Union[dict[str, Any], tuple[Any], list[Any], None],
     equalities_inputs: EqualityConstraint,
     original_signature: inspect.Signature,
-    _is_torch_jit_trace=False,
 ):
     """
     Given a fake mode, sources pairs corresponding to equal dynamic shape dimensions,
@@ -454,16 +568,14 @@ def produce_guards_and_solve_constraints(
         raise constraint_violation_error
     dim_constraints.solve()
     forced_specializations = dim_constraints.forced_specializations()
-    if not _is_torch_jit_trace:
-        msg = dim_constraints.prettify_results(
-            original_signature,
-            dynamic_shapes,  # type: ignore[arg-type]
-            constraint_violation_error,
-            forced_specializations,  # type: ignore[arg-type]
-        )
-    else:
-        # FIXME(ycao): This is a hack to get around missing signature from ScriptMethod
-        msg = "dummy constraint violation message"
+
+    msg = dim_constraints.prettify_results(
+        original_signature,
+        dynamic_shapes,  # type: ignore[arg-type]
+        constraint_violation_error,
+        forced_specializations,  # type: ignore[arg-type]
+    )
+
     if constraint_violation_error:
         constraint_violation_error.args = (constraint_violation_error.args[0] + msg,)
     elif forced_specializations:
@@ -791,7 +903,7 @@ def _fakify_script_objects(
     mod: torch.nn.Module,
     args: Sequence[Any],
     kwargs: dict[Any, Any],
-    fake_mode: torch._subclasses.fake_tensor.FakeTensorMode,
+    fake_mode: Optional[torch._subclasses.fake_tensor.FakeTensorMode],
 ):
     # This context manager is used to fakify script objects into FakeScriptObject.
     # Inputs:
@@ -914,41 +1026,74 @@ class _NonStrictTorchFunctionHandler(torch.overrides.TorchFunctionMode):
             # because it has some known incompletenesses, e.g., it doesn't support
             # empty data. See https://github.com/pytorch/pytorch/issues/143216
             if any(
-                isinstance(a, torch.SymInt) for a in pytree.tree_flatten(args[0])[0]
+                isinstance(a, (torch.SymInt, torch.SymFloat, torch.SymBool))
+                for a in pytree.tree_flatten(args[0])[0]
             ):
                 return torch._refs.tensor, args, kwargs
         if func.__name__ == "__getitem__" and isinstance(args[0], torch.Tensor):
 
             def rewrite(dim, item):
                 # Redirect to torch.select for indexing.
+                if item is None:
+                    return dim + 1, (torch.unsqueeze, [dim])
                 if isinstance(item, (int, torch.SymInt)):
                     return dim, (torch.select, [dim, item])
                 # Redirect to torch.ops.aten.slice for slicing.
                 if isinstance(item, slice):
+                    step = item.step or 1
+                    if item.start is None and item.stop is None and step == 1:
+                        # no-op
+                        return dim + 1, (lambda t: t, [])
                     return dim + 1, (
                         torch.ops.aten.slice,
-                        [dim, item.start, item.stop, item.step or 1],
+                        [dim, item.start, item.stop, step],
                     )
                 # Otherwise do nothing.
 
-            items = args[1] if isinstance(args[1], tuple) else (args[1],)
-            dim = 0
-            # Sequence rewrites.
-            sequence = []
-            for item in items:
-                if (r := rewrite(dim, item)) is None:
-                    return func, args, kwargs
-                dim, call_spec = r
-                sequence.append(call_spec)
+            items = list(args[1]) if isinstance(args[1], tuple) else [args[1]]
 
-            def run():
-                # Run sequence.
-                t = args[0]
-                for _method, _args in sequence:
-                    t = _method(t, *_args)
-                return t
+            has_symint = False
+            index_ellipsis = None
+            t = args[0]
+            n_none_slices = t.ndim + 1
+            for i, item in enumerate(items):
+                if isinstance(item, torch.SymInt) or (
+                    isinstance(item, slice)
+                    and any(
+                        isinstance(s, torch.SymInt)
+                        for s in (item.start, item.stop, item.step)
+                    )
+                ):
+                    has_symint = True
+                if item is Ellipsis:
+                    index_ellipsis = i
+                if item is not None:
+                    n_none_slices -= 1
 
-            return run, [], {}
+            # only rewrite when there are symints
+            if has_symint:
+                if index_ellipsis is not None:
+                    none_slices = [slice(None)] * n_none_slices
+                    items[index_ellipsis : index_ellipsis + 1] = none_slices
+
+                dim = 0
+                # Sequence rewrites.
+                sequence = []
+                for item in items:
+                    if (r := rewrite(dim, item)) is None:
+                        return func, args, kwargs
+                    dim, call_spec = r
+                    sequence.append(call_spec)
+
+                def run():
+                    # Run sequence.
+                    # pyrefly: ignore [index-error]
+                    t = args[0]
+                    for _method, _args in sequence:
+                        t = _method(t, *_args)
+                    return t
+
+                return run, [], {}
 
         return func, args, kwargs
 

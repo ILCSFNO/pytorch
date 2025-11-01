@@ -85,7 +85,7 @@ class XPUInductorQuantizer(X86InductorQuantizer):
         overrides. We keep the annotate methods but make the function
         body empty, aiming to let `_generate_qdq_quantized_model`
         generate qdq around op and graph execute on fp32 dtype for
-        unspported operators.
+        unsupported operators.
     """
 
     def _annotate_qat_conv2d_fusion_pattern(
@@ -112,7 +112,7 @@ class XPUInductorQuantizer(X86InductorQuantizer):
         node: Node,
     ) -> None:
         if (node.target in int8_in_int8_out_ops) and (_is_any_annotated([node])):
-            if node.target == torch.ops.aten.max_pool2d.default:
+            if node.target is torch.ops.aten.max_pool2d.default:
                 return
             else:
                 input_node = node.all_input_nodes[0]

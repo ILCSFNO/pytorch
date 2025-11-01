@@ -4,6 +4,7 @@
 #include <c10/core/ScalarType.h>
 #include <c10/core/SymIntArrayRef.h>
 #include <c10/util/DimVector.h>
+#include <c10/util/Exception.h>
 #include <optional>
 #include <sstream>
 #include <vector>
@@ -25,21 +26,57 @@ inline void infer_size_impl(
   // N.B. this is an index, not a sym dim!
   std::optional<int64_t> infer_dim;
   for (int64_t dim = 0, ndim = shape.size(); dim != ndim; dim++) {
-    // We can avoid failing on unbacked shape[dim] and assert that it is >=0
-    // following python behaviour.
-    if (shape[dim] == -1) {
-      if (infer_dim) {
-        throw std::runtime_error("only one dimension can be inferred");
-      }
+    if (TORCH_GUARD_OR_FALSE(sym_eq(shape[dim], -1))) {
+      TORCH_CHECK(!infer_dim, "only one dimension can be inferred");
       infer_dim = dim;
-    } else if (shape[dim] >= 0) {
-      newsize *= shape[dim];
     } else {
-      TORCH_CHECK(false, "invalid shape dimension ", shape[dim]);
+      // in case of unbacked shape[dim] we assume it's not -1 and add a runtime
+      // assertion.
+      TORCH_MAYBE_SYM_CHECK(
+          sym_gt(shape[dim], -1),
+          "invalid shape dimension ",
+          shape[dim],
+          " at index ",
+          dim,
+          " of shape ",
+          shape);
+      newsize *= shape[dim];
     }
   }
 
-  auto set_infer_dim = [&]() {
+  if (infer_dim) {
+    // numel is the product of known sizes, it has to be divisible by newsize.
+    // and newsize should be positive unless newsize == numel (we throw
+    // different) error message in that case.
+    if constexpr (std::is_same_v<NumelType, c10::SymInt>) {
+      auto v = newsize.maybe_as_int();
+      if (v and *v == 0) {
+        // Avoid div by 0 when sym_eq(numel % newsize, 0) is constructed!
+        // which may happen when newsize is not a symbol! if its a symbol
+        // division won't happen anyway during compile.
+        TORCH_MAYBE_SYM_CHECK(
+            numel == newsize,
+            "shape '",
+            shape,
+            "' is invalid for input of size ",
+            numel);
+      } else {
+        auto cond = sym_gt(newsize, 0)
+                        .sym_and(sym_eq(numel % newsize, 0))
+                        .sym_or(sym_eq(numel, newsize));
+        TORCH_MAYBE_SYM_CHECK(
+            cond, "shape '", shape, "' is invalid for input of size ", numel);
+      }
+
+    } else {
+      TORCH_CHECK(
+          (newsize > 0 && (numel % newsize == 0)) || numel == newsize,
+          "shape '",
+          shape,
+          "' is invalid for input of size ",
+          numel);
+    }
+
     // We have a degree of freedom here to select the dimension size; follow
     // NumPy semantics and just bail.  However, a nice error message is needed
     // because users often use `view` as a way to flatten & unflatten
@@ -48,18 +85,14 @@ inline void infer_size_impl(
     // works yet
     //   empty_tensor.view(-1, 0)
     // doesn't.
-    TORCH_CHECK(
+    TORCH_MAYBE_SYM_CHECK(
         newsize != 0,
         "cannot reshape tensor of 0 elements into shape ",
         shape,
         " because the unspecified dimension size -1 can be any "
         "value and is ambiguous");
-    res[*infer_dim] = numel / newsize;
-    return;
-  };
 
-  if (infer_dim && newsize > 0 && numel % newsize == 0) {
-    set_infer_dim();
+    res[*infer_dim] = numel / newsize;
     return;
   }
 
@@ -69,9 +102,6 @@ inline void infer_size_impl(
       shape,
       "' is invalid for input of size ",
       numel);
-  if (infer_dim) {
-    set_infer_dim();
-  }
 }
 
 inline std::vector<int64_t> infer_size(IntArrayRef shape, int64_t numel) {

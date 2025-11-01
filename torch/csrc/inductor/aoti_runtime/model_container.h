@@ -12,18 +12,17 @@
 // applies to other files under torch/csrc/inductor/aoti_runtime/.
 #include <torch/csrc/inductor/aoti_runtime/model.h>
 
-namespace {
-
+namespace torch::aot_inductor {
 // The state transition is done by:
 // (1) NONE state: The default state when created. This state should only exist
 // when model_container is created and no constants are being loaded or updated.
 // (2) INITIALIZED state: This state get set whenever we load the constants into
 // the buffer. This could be done by load_constants or update_constants_buffer.
-// (3) FOLDED state: This state should transition from INITIALILZED after
+// (3) FOLDED state: This state should transition from INITIALIZED after
 // const_fold is being invoked.
 enum class ConstantState : uint8_t { NONE, INITIALIZED, FOLDED, UNKNOWN };
 
-std::string toStringConstantState(ConstantState state) {
+inline std::string toStringConstantState(ConstantState state) {
   switch (state) {
     case ConstantState::NONE:
       return "ConstantState::NONE";
@@ -37,10 +36,6 @@ std::string toStringConstantState(ConstantState state) {
       return "Unknown enum class state for ConstantState";
   }
 }
-
-} // namespace
-
-namespace torch::aot_inductor {
 
 class AOTInductorModelContainer {
  public:
@@ -128,8 +123,10 @@ class AOTInductorModelContainer {
       constants_folding_lk.unlock();
       model_lk.lock();
     } else if (const_folded != ConstantState::FOLDED) {
-      throw std::runtime_error(
-          "Unknown constant state: " + toStringConstantState(constant_folded_));
+      STD_TORCH_CHECK(
+          false,
+          "Unknown constant state: ",
+          toStringConstantState(constant_folded_));
     }
 
     try {
@@ -172,8 +169,10 @@ class AOTInductorModelContainer {
           /* validate_full_update = */ false);
       const_folded = ConstantState::FOLDED;
     } else if (constant_folded_ != ConstantState::FOLDED) {
-      throw std::runtime_error(
-          "Unknown constant state: " + toStringConstantState(constant_folded_));
+      STD_TORCH_CHECK(
+          false,
+          "Unknown constant state: ",
+          toStringConstantState(constant_folded_));
     }
 
     model->run_single_threaded(
@@ -207,50 +206,71 @@ class AOTInductorModelContainer {
   }
 
   size_t num_constants() const {
-    if (this->num_models() == 0) {
-      throw std::runtime_error("No available models in container!");
-    }
+    STD_TORCH_CHECK(
+        this->num_models() != 0, "No available models in container!");
+
     return models_[0]->num_constants();
   }
 
   // retrieve the constant name of constants_info_[idx]
   const char* constant_name(size_t idx) const {
-    if (this->num_models() == 0) {
-      throw std::runtime_error("No available models in container!");
-    }
+    STD_TORCH_CHECK(
+        this->num_models() != 0, "No available models in container!");
+
     return models_[0]->constant_name(static_cast<int64_t>(idx));
   }
 
   // retrieve original FQN of constants_info_[idx]
   const char* constant_original_fqn(size_t idx) const {
-    if (this->num_models() == 0) {
-      throw std::runtime_error("No available models in container!");
-    }
+    STD_TORCH_CHECK(
+        this->num_models() != 0, "No available models in container!");
+
     return models_[0]->constant_original_fqn(static_cast<int64_t>(idx));
   }
 
   // retrieve whether constant is from folded of constants_info_[idx]
   bool constant_from_folded(size_t idx) const {
-    if (this->num_models() == 0) {
-      throw std::runtime_error("No available models in container!");
-    }
+    STD_TORCH_CHECK(
+        this->num_models() != 0, "No available models in container!");
+
     return models_[0]->constant_from_folded(static_cast<int64_t>(idx));
+  }
+
+  size_t constant_data_size(size_t idx) const {
+    STD_TORCH_CHECK(
+        this->num_models() != 0, "No available models in container!");
+
+    return models_[0]->constant_data_size(static_cast<int64_t>(idx));
   }
 
   // retrieve type of constants_info_[idx]
   int32_t constant_type(size_t idx) const {
-    if (this->num_models() == 0) {
-      throw std::runtime_error("No available models in container!");
-    }
+    STD_TORCH_CHECK(
+        this->num_models() != 0, "No available models in container!");
+
     return models_[0]->constant_type(static_cast<int64_t>(idx));
   }
 
   // retrieve dtype of constants_info_[idx]
   int32_t constant_dtype(size_t idx) const {
+    STD_TORCH_CHECK(
+        this->num_models() != 0, "No available models in container!");
+
+    return models_[0]->constant_dtype(static_cast<int64_t>(idx));
+  }
+
+  uint64_t constant_blob_size() const {
     if (this->num_models() == 0) {
       throw std::runtime_error("No available models in container!");
     }
-    return models_[0]->constant_dtype(static_cast<int64_t>(idx));
+    return models_[0]->constant_blob_size();
+  }
+
+  void update_constants_from_blob(const uint8_t* weight_blob_ptr) {
+    if (this->num_models() == 0) {
+      throw std::runtime_error("No available models in container!");
+    }
+    return models_[0]->update_constants_from_blob(weight_blob_ptr);
   }
 
   void run_const_fold(
@@ -332,8 +352,19 @@ class AOTInductorModelContainer {
     return constant_type == ConstantType::Buffer;
   }
 
-  bool _is_tensor_constant_or_buffer_type(const size_t idx) const {
-    return _is_tensor_constant_type(idx) || _is_buffer_type(idx);
+  bool _is_empty_parameter_type(const size_t idx) const {
+    auto constant_type = models_[0]->constant_type(static_cast<int64_t>(idx));
+    auto constant_data_size =
+        models_[0]->constant_data_size(static_cast<int64_t>(idx));
+    // Empty parameters are skipped and not provided by the upstream services,
+    // it is OK to skip.
+    return constant_type == ConstantType::Parameter && constant_data_size == 0;
+  }
+
+  bool _is_tensor_constant_or_buffer_type_or_empty_parameter(
+      const size_t idx) const {
+    return _is_tensor_constant_type(idx) || _is_buffer_type(idx) ||
+        _is_empty_parameter_type(idx);
   }
 
   void assert_all_constants(
@@ -348,17 +379,20 @@ class AOTInductorModelContainer {
           std::string(models_[0]->constant_name(static_cast<int64_t>(idx)));
       auto it = constants_map.find(constant_name);
       if (it == constants_map.end()) {
-        if (_is_tensor_constant_or_buffer_type(idx)) {
+        if (_is_tensor_constant_or_buffer_type_or_empty_parameter(idx)) {
           // tracing sometimes creates tensors that are non-existent in
           // original graph. We could skip those and do a direct copy.
-          std::cerr << "[WARNING] Found constant or module state buffer "
-                    << constant_name
+          std::cerr << "[WARNING] Found constant or module state buffer or "
+                    << "empty module state parameter " << constant_name
                     << " in model, but not provided by user!\n";
           continue;
         }
-        throw std::runtime_error(
-            std::string("Cannot find constants ") + constant_name +
-            std::string(" in constants_map!"));
+
+        STD_TORCH_CHECK(
+            false,
+            "Cannot find constants ",
+            constant_name,
+            " in constants_map!");
       }
     }
   }
@@ -368,9 +402,8 @@ class AOTInductorModelContainer {
       std::unordered_map<std::string, AtenTensorHandle>&& constants_map,
       bool use_inactive,
       bool validate_full_update) {
-    if (this->num_models() == 0) {
-      throw std::runtime_error("No model available in container!");
-    }
+    STD_TORCH_CHECK(
+        this->num_models() != 0, "No available models in container!");
     if (validate_full_update) {
       assert_all_constants(constants_map);
     }
@@ -416,9 +449,9 @@ class AOTInductorModelContainer {
       bool use_inactive,
       bool validate_full_update,
       bool user_managed = false) {
-    if (this->num_models() == 0) {
-      throw std::runtime_error("No model available in container!");
-    }
+    STD_TORCH_CHECK(
+        this->num_models() != 0, "No model available in container!");
+
     if (validate_full_update) {
       assert_all_constants(constants_map);
     }
@@ -437,7 +470,8 @@ class AOTInductorModelContainer {
           std::string(models_[0]->constant_name(static_cast<int64_t>(idx)));
       auto it = constants_map.find(constant_name);
       if (it == constants_map.end() &&
-          !(use_inactive && _is_tensor_constant_or_buffer_type(idx))) {
+          !(use_inactive &&
+            _is_tensor_constant_or_buffer_type_or_empty_parameter(idx))) {
         continue;
       }
 
@@ -465,16 +499,36 @@ class AOTInductorModelContainer {
           constants_blob_ptr + constants_internal_offset_[idx];
       void* user_constant_ptr;
       int64_t constant_size;
+      int64_t* stride;
+      int64_t offset;
       aoti_torch_get_data_ptr(tensor, &user_constant_ptr);
       aoti_torch_get_storage_size(tensor, &constant_size);
+      AOTI_TORCH_ERROR_CODE_CHECK(aoti_torch_get_strides(tensor, &stride));
+      AOTI_TORCH_ERROR_CODE_CHECK(
+          aoti_torch_get_storage_offset(tensor, &offset));
+      auto dtype = models_[0]->constant_dtype(idx);
+
 #ifdef USE_XPU
       sycl::queue* queue_ptr = nullptr;
       aoti_torch_get_current_sycl_queue((void**)&queue_ptr);
       queue_ptr
           ->memcpy(internal_constants_ptr, user_constant_ptr, constant_size)
           .wait();
+#elif USE_MPS
+      internal_constants_ptr = constants_blob_ptr;
+      aoti_torch_mps_copy_buffer(
+          user_constant_ptr,
+          constants_blob_ptr,
+          constant_size,
+          offset,
+          constants_internal_offset_[idx]);
+      // For mps tensors, all constants are stored in one buffer, with the
+      // offset being where the constant starts. So we want to change the
+      // constant tensor's offset to point to constants_internal_offset_[idx]
+      offset = constants_internal_offset_[idx] /
+          aoti_torch_dtype_element_size(dtype);
 #elif USE_CUDA
-      AOTI_RUNTIME_DEVICE_CHECK(cudaMemcpy(
+      AOTI_RUNTIME_CUDA_CHECK(cudaMemcpy(
           internal_constants_ptr,
           user_constant_ptr,
           constant_size,
@@ -486,20 +540,15 @@ class AOTInductorModelContainer {
       // We extract stride and offset from provided Tensor since we do not
       // guarantee that the tensor is contiguous.
       AtenTensorHandle tensor_handle;
-      int64_t* stride;
-      int64_t offset;
       int device_type = models_[0]->get_device_type();
       int device_idx = models_[0]->get_device_idx();
-      AOTI_TORCH_ERROR_CODE_CHECK(aoti_torch_get_strides(tensor, &stride));
-      AOTI_TORCH_ERROR_CODE_CHECK(
-          aoti_torch_get_storage_offset(tensor, &offset));
       AOTI_TORCH_ERROR_CODE_CHECK(aoti_torch_create_tensor_from_blob(
           internal_constants_ptr,
           models_[0]->constant_ndim(idx),
           models_[0]->constant_shape(idx),
           stride,
           offset,
-          models_[0]->constant_dtype(idx),
+          dtype,
           device_type,
           device_idx,
           &tensor_handle));
@@ -664,7 +713,7 @@ class AOTInductorModelContainer {
   std::shared_mutex model_exec_mutex_;
 
   RAIIDataPtr allocate_constant_blob() {
-#if defined(USE_CUDA) || defined(USE_XPU)
+#if defined(USE_CUDA) || defined(USE_XPU) || defined(USE_MPS)
     return RAII_gpuMalloc(blob_size_);
 #else
     return RAII_cpuMalloc(blob_size_);

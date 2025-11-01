@@ -5,6 +5,9 @@ import operator
 from typing import Any, TYPE_CHECKING
 
 import torch
+
+# NOTE: other files rely on the imports below
+from torch._dynamo import callback as compilation_callback  # noqa: F401
 from torch._inductor.runtime.cache_dir_utils import (  # noqa: F401
     cache_dir,
     default_cache_dir,
@@ -22,8 +25,8 @@ def conditional_product(*args: int) -> int:
     return functools.reduce(operator.mul, [x for x in args if x])
 
 
-def ceildiv(numer: int, denom: int) -> int:
-    return -(numer // -denom)
+def ceildiv(number: int, denom: int) -> int:
+    return -(number // -denom)
 
 
 def is_power_of_2(n: int) -> bool:
@@ -65,8 +68,11 @@ def triton_config_to_hashable(cfg: Config) -> Hashable:
     Convert triton config to a tuple that can uniquely identify it. We can use
     the return value as a dictionary key.
     """
+    # pyrefly: ignore [missing-attribute]
     items = sorted(cfg.kwargs.items())
+    # pyrefly: ignore [missing-attribute]
     items.append(("num_warps", cfg.num_warps))
+    # pyrefly: ignore [missing-attribute]
     items.append(("num_stages", cfg.num_stages))
     return tuple(items)
 
@@ -100,6 +106,7 @@ def get_max_y_grid() -> int:
 
 
 try:
+    # pyrefly: ignore [import-error]
     import colorama
 
     HAS_COLORAMA = True
@@ -111,6 +118,7 @@ except ModuleNotFoundError:
 if HAS_COLORAMA:
 
     def _color_text(msg: str, color: str) -> str:
+        # pyrefly: ignore [missing-attribute]
         return getattr(colorama.Fore, color.upper()) + msg + colorama.Fore.RESET
 
 else:
@@ -152,7 +160,7 @@ dynamo_timed = torch._dynamo.utils.dynamo_timed  # type: ignore[has-type]
 def triton_hash_to_path_key(key: str) -> str:
     # In early versions of Triton, the hash is directly used in the path name.
     # Later, the hash is converted to base64 before being used in the path name.
-    # Later, the base64 convertion was replaced to the base32
+    # Later, the base64 conversion was replaced to the base32
     #
     # This code tries to import _base64 and falls back to _base32 if _base64 is unavailable.
     #

@@ -5,7 +5,8 @@ This package enables an interface for accessing MTIA backend in python
 
 import threading
 import warnings
-from typing import Any, Callable, Optional, Union
+from collections.abc import Callable
+from typing import Any, Optional, Union
 
 import torch
 from torch import device as _device, Tensor
@@ -198,10 +199,15 @@ def snapshot() -> dict[str, Any]:
 
 
 def attach_out_of_memory_observer(
-    observer: Callable[[int, int, int, int], None]
+    observer: Callable[[int, int, int, int], None],
 ) -> None:
     r"""Attach an out-of-memory observer to MTIA memory allocator"""
     torch._C._mtia_attachOutOfMemoryObserver(observer)
+
+
+def is_bf16_supported(including_emulation: bool = True):
+    r"""Return a bool indicating if the current MTIA device supports dtype bfloat16."""
+    return True
 
 
 def get_device_capability(device: Optional[_device_t] = None) -> tuple[int, int]:
@@ -246,6 +252,17 @@ def set_device(device: _device_t) -> None:
         torch._C._accelerator_hooks_set_current_device(device)
 
 
+def get_device_properties(device: Optional[_device_t] = None) -> dict[str, Any]:
+    r"""Return a dictionary of MTIA device properties
+
+    Args:
+        device (torch.device or int, optional) selected device. Returns
+            statistics for the current device, given by current_device(),
+            if device is None (default).
+    """
+    return torch._C._mtia_getDeviceProperties(_get_device_index(device, optional=True))
+
+
 class device:
     r"""Context-manager that changes the selected device.
 
@@ -286,7 +303,7 @@ class StreamContext:
         self.idx = _get_device_index(None, True)
         if not torch.jit.is_scripting():
             if self.idx is None:
-                self.idx = -1
+                self.idx = -1  # pyrefly: ignore [bad-assignment]
 
         self.src_prev_stream = (
             None if not torch.jit.is_scripting() else torch.mtia.default_stream(None)
@@ -322,6 +339,17 @@ class StreamContext:
         if self.src_prev_stream.device != cur_stream.device:  # type: ignore[union-attr]
             torch.mtia.set_stream(self.dst_prev_stream)  # type: ignore[arg-type]
         torch.mtia.set_stream(self.src_prev_stream)  # type: ignore[arg-type]
+
+
+def _set_stream_by_id(stream_id, device_index, device_type):
+    r"""set stream specified by the stream id, device index and
+        device type
+
+    Args: stream_id (int): stream id in stream pool
+          device_index (int): device index in topo
+          device_type (int): enum device type
+    """
+    torch._C._mtia_setStream(stream_id, device_index, device_type)
 
 
 def stream(stream: Optional["torch.mtia.Stream"]) -> StreamContext:
@@ -381,8 +409,10 @@ __all__ = [
     "default_stream",
     "memory_stats",
     "max_memory_allocated",
+    "memory_allocated",
     "reset_peak_memory_stats",
     "get_device_capability",
+    "get_device_properties",
     "record_memory_history",
     "snapshot",
     "attach_out_of_memory_observer",
@@ -393,4 +423,5 @@ __all__ = [
     "device",
     "set_rng_state",
     "get_rng_state",
+    "is_bf16_supported",
 ]

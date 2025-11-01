@@ -133,7 +133,8 @@ static PyObject* THPSize_pynew(
 static PyObject* THPSize_repr(THPSize* self) {
   HANDLE_TH_ERRORS
   std::string repr("torch.Size([");
-  for (Py_ssize_t i = 0; i < PyTuple_Size((PyObject*)self); ++i) {
+  for (Py_ssize_t i = 0; i < PyTuple_Size(reinterpret_cast<PyObject*>(self));
+       ++i) {
     if (i != 0) {
       repr += ", ";
     }
@@ -156,22 +157,60 @@ static PyObject* wrap_tuple_fn(Args... args) {
     return nullptr;
   if (PyTuple_Check(result.get())) {
     return PyObject_CallFunctionObjArgs(
-        (PyObject*)&THPSizeType, result.get(), nullptr);
+        reinterpret_cast<PyObject*>(&THPSizeType), result.get(), nullptr);
   }
   return result.release();
 }
 
+static PyObject* THPSize_concat(PyObject* left, PyObject* right) {
+  // wrap tuple's sq_concat with a customized error message
+  HANDLE_TH_ERRORS
+  TORCH_CHECK_TYPE(
+      PyTuple_Check(right),
+      "can only concatenate tuple (not ",
+      Py_TYPE(right)->tp_name,
+      ") to torch.Size");
+  static binaryfunc tuple_concat = PyTuple_Type.tp_as_sequence->sq_concat;
+  static binaryfunc size_concat =
+      wrap_tuple_fn<decltype(&tuple_concat), &tuple_concat>;
+  return size_concat(left, right);
+  END_HANDLE_TH_ERRORS
+}
+
+static PyObject* THPSize_add(PyObject* left, PyObject* right) {
+  /* NOTE: The python interpreter tries, in order:
+   *   1. right.nb_add(left, right)  (only if right is a subclass of left)
+   *   2. left.nb_add(left, right)
+   *   3. right.nb_add(left, right)
+   *   4. left.sq_concat(right)
+   * Hence, to support tuple + size -> size, we need to implement nb_add.
+   */
+  HANDLE_TH_ERRORS
+  if (!PyTuple_Check(left) || !PyTuple_Check(right)) {
+    Py_RETURN_NOTIMPLEMENTED;
+  }
+  return THPSize_concat(left, right);
+  END_HANDLE_TH_ERRORS
+}
+
+// Needed to ensure tuple + size returns a size instead of a tuple
+static PyNumberMethods THPSize_as_number = {
+    &THPSize_add, // nb_add
+    nullptr, // nb_subtract
+    nullptr, // nb_multiply
+    // ... rest nullptr
+};
+
 // We use an anonymous namespace instead of static to work around
 // (what @peterjc123 think is) a bug in Visual Studio
 namespace {
-auto sq_concat = PyTuple_Type.tp_as_sequence->sq_concat;
 auto sq_repeat = PyTuple_Type.tp_as_sequence->sq_repeat;
 binaryfunc mp_subscript = PyTuple_Type.tp_as_mapping->mp_subscript;
 } // namespace
 
 static PySequenceMethods THPSize_as_sequence = {
     nullptr, /* sq_length */
-    wrap_tuple_fn<decltype(&sq_concat), &sq_concat>,
+    &THPSize_concat, /* sq_concat */
     wrap_tuple_fn<decltype(&sq_repeat), &sq_repeat>,
     nullptr, /* sq_item */
     nullptr, /* sq_slice */
@@ -187,9 +226,9 @@ static PyMappingMethods THPSize_as_mapping = {
 
 static PyObject* THPSize_numel(PyObject* _self, PyObject* noargs) {
   HANDLE_TH_ERRORS
-  auto self = (THPSize*)_self;
+  auto self = reinterpret_cast<THPSize*>(_self);
   int64_t numel = 1;
-  for (Py_ssize_t i = 0; i < PyTuple_Size((PyObject*)self); ++i) {
+  for (Py_ssize_t i = 0; i < PyTuple_Size(_self); ++i) {
     numel *= THPUtils_unpackLong(PyTuple_GET_ITEM(self, i));
   }
   return THPUtils_packInt64(numel);
@@ -198,19 +237,19 @@ static PyObject* THPSize_numel(PyObject* _self, PyObject* noargs) {
 
 static PyObject* THPSize_reduce(PyObject* _self, PyObject* noargs) {
   HANDLE_TH_ERRORS
-  auto self = (THPSize*)_self;
+  auto self = reinterpret_cast<THPSize*>(_self);
   auto ret = THPObjectPtr{PyTuple_New(2)};
   if (!ret)
     throw python_error();
 
-  auto obj = (PyObject*)(&THPSizeType);
+  auto obj = reinterpret_cast<PyObject*>(&THPSizeType);
   Py_INCREF(&THPSizeType);
   PyTuple_SET_ITEM(ret.get(), 0, obj);
 
-  THPObjectPtr t(PyTuple_New(PyTuple_Size((PyObject*)self)));
+  THPObjectPtr t(PyTuple_New(PyTuple_Size(_self)));
   if (!t)
     throw python_error();
-  for (Py_ssize_t i = 0; i < PyTuple_Size((PyObject*)self); ++i) {
+  for (Py_ssize_t i = 0; i < PyTuple_Size(_self); ++i) {
     auto d = PyTuple_GET_ITEM(self, i);
     Py_INCREF(d);
     PyTuple_SET_ITEM(t.get(), i, d);
@@ -241,8 +280,8 @@ PyTypeObject THPSizeType = {
     nullptr, /* tp_getattr */
     nullptr, /* tp_setattr */
     nullptr, /* tp_reserved */
-    (reprfunc)THPSize_repr, /* tp_repr */
-    nullptr, /* tp_as_number */
+    reinterpret_cast<reprfunc>(THPSize_repr), /* tp_repr */
+    &THPSize_as_number, /* tp_as_number */
     &THPSize_as_sequence, /* tp_as_sequence */
     &THPSize_as_mapping, /* tp_as_mapping */
     nullptr, /* tp_hash  */
@@ -277,7 +316,8 @@ void THPSize_init(PyObject* module) {
     throw python_error();
   }
   Py_INCREF(&THPSizeType);
-  if (PyModule_AddObject(module, "Size", (PyObject*)&THPSizeType) < 0) {
+  if (PyModule_AddObject(
+          module, "Size", reinterpret_cast<PyObject*>(&THPSizeType)) < 0) {
     throw python_error();
   }
 }

@@ -1,7 +1,8 @@
 # mypy: allow-untyped-defs
+from collections.abc import Callable
 from itertools import chain
 from operator import getitem
-from typing import Callable, Optional, Union
+from typing import Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -90,12 +91,10 @@ def _get_supported_activation_modules():
     return SUPPORTED_ACTIVATION_MODULES
 
 
-def _get_default_structured_pruning_patterns() -> (
-    dict[
-        tuple[Union[type[nn.Module], Callable, MatchAllNode, str], ...],
-        Callable[..., None],
-    ]
-):
+def _get_default_structured_pruning_patterns() -> dict[
+    tuple[Union[type[nn.Module], Callable, MatchAllNode, str], ...],
+    Callable[..., None],
+]:
     """
     Returns the patterns for conv2d / linear conversion for each element in the activation functions/modules defined above.
     """
@@ -261,6 +260,7 @@ class BaseStructuredSparsifier(BaseSparsifier):
                     module.register_parameter(
                         "_bias", nn.Parameter(module.bias.detach())
                     )
+                    # pyrefly: ignore [bad-assignment]
                     module.bias = None
                     module.prune_bias = prune_bias
 

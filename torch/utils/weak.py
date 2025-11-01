@@ -1,18 +1,50 @@
 # mypy: allow-untyped-defs
 from __future__ import annotations
 
-import weakref
-from weakref import ref
-from _weakrefset import _IterationGuard  # type: ignore[attr-defined]
-from collections.abc import MutableMapping, Mapping
-from torch import Tensor
 import collections.abc as _collections_abc
+import weakref
+from collections.abc import Mapping, MutableMapping
+from weakref import ref
+
+from torch import Tensor
 
 
 WeakRef = ref
 
 
-__all__ = ['TensorWeakRef', 'WeakIdRef', 'WeakIdKeyDictionary', 'WeakTensorKeyDictionary']
+__all__ = [
+    "TensorWeakRef",
+    "WeakIdRef",
+    "WeakIdKeyDictionary",
+    "WeakTensorKeyDictionary",
+]
+
+
+# TODO: make weakref properly thread safe following
+# https://github.com/python/cpython/pull/125325
+class _IterationGuard:
+    # This context manager registers itself in the current iterators of the
+    # weak container, such as to delay all removals until the context manager
+    # exits.
+    # This technique should be relatively thread-safe (since sets are).
+
+    def __init__(self, weakcontainer):
+        # Don't create cycles
+        self.weakcontainer = ref(weakcontainer)
+
+    def __enter__(self):
+        w = self.weakcontainer()
+        if w is not None:
+            w._iterating.add(self)
+        return self
+
+    def __exit__(self, e, t, b):
+        w = self.weakcontainer()
+        if w is not None:
+            s = w._iterating
+            s.remove(self)
+            if not s:
+                w._commit_removals()
 
 
 # This file defines a variant of WeakKeyDictionary that overrides the hashing
@@ -41,7 +73,7 @@ __all__ = ['TensorWeakRef', 'WeakIdRef', 'WeakIdKeyDictionary', 'WeakTensorKeyDi
 # WeakIdRef(tensor) rather than weakref.ref(tensor); it handles a number of
 # easy to get wrong cases transparently for you.
 class WeakIdRef(weakref.ref):
-    __slots__ = ['_id']
+    __slots__ = ["_id"]
 
     def __init__(self, key, callback=None):
         # Unlike stock weakref, which preserves hash semantics of the
@@ -55,7 +87,7 @@ class WeakIdRef(weakref.ref):
     def __call__(self):
         r = super().__call__()
         # Special logic for Tensor PyObject resurrection
-        if hasattr(r, '_fix_weakref'):
+        if hasattr(r, "_fix_weakref"):
             r._fix_weakref()  # type: ignore[union-attr]
         return r
 
@@ -81,10 +113,11 @@ class WeakIdRef(weakref.ref):
             return a is b
         return self is other
 
+
 # This is the same as WeakIdRef but equality is checked using hash() rather than id.
 # This will be equivalent to the one above except for classes where hash is not their id.
 class _WeakHashRef(weakref.ref):
-    __slots__ = ['_id']
+    __slots__ = ["_id"]
 
     def __init__(self, key, callback=None):
         # Unlike stock weakref, which preserves hash semantics of the
@@ -98,7 +131,7 @@ class _WeakHashRef(weakref.ref):
     def __call__(self):
         r = super().__call__()
         # Special logic for Tensor PyObject resurrection
-        if hasattr(r, '_fix_weakref'):
+        if hasattr(r, "_fix_weakref"):
             r._fix_weakref()  # type: ignore[union-attr]
         return r
 
@@ -114,6 +147,7 @@ class _WeakHashRef(weakref.ref):
         if a is not None and b is not None:
             return hash(a) == hash(b)
         return self is other
+
 
 # This is directly adapted from cpython/Lib/weakref.py
 class WeakIdKeyDictionary(MutableMapping):
@@ -132,6 +166,7 @@ class WeakIdKeyDictionary(MutableMapping):
                         del self.data[k]
                     except KeyError:
                         pass
+
         self._remove = remove
         # A list of dead weakrefs (keys to be removed)
         self._pending_removals = []
@@ -196,6 +231,7 @@ class WeakIdKeyDictionary(MutableMapping):
 
     def __deepcopy__(self, memo):
         from copy import deepcopy
+
         new = self.__class__()
         with _IterationGuard(self):
             for key, value in self.data.items():
@@ -256,12 +292,16 @@ class WeakIdKeyDictionary(MutableMapping):
             if o is not None:
                 return o, value
 
+    # pyrefly: ignore [bad-override]
     def pop(self, key, *args):
         self._dirty_len = True
+        # pyrefly: ignore [not-iterable]
         return self.data.pop(self.ref_type(key), *args)  # CHANGED
 
     def setdefault(self, key, default=None):
-        return self.data.setdefault(self.ref_type(key, self._remove), default)  # CHANGED
+        return self.data.setdefault(
+            self.ref_type(key, self._remove), default
+        )  # CHANGED
 
     def update(self, dict=None, **kwargs):  # type: ignore[override]
         d = self.data
@@ -270,7 +310,7 @@ class WeakIdKeyDictionary(MutableMapping):
                 dict = type({})(dict)
             for key, value in dict.items():
                 d[self.ref_type(key, self._remove)] = value  # CHANGED
-        if len(kwargs):
+        if kwargs:
             self.update(kwargs)
 
     def __ior__(self, other):
@@ -297,7 +337,10 @@ class WeakIdKeyDictionary(MutableMapping):
     def __eq__(self, other):
         if not isinstance(other, Mapping):
             return NotImplemented
-        return {id(k): v for k, v in self.items()} == {id(k): v for k, v in other.items()}
+        return {id(k): v for k, v in self.items()} == {
+            id(k): v for k, v in other.items()
+        }
+
 
 # Convenience alias
 WeakTensorKeyDictionary = WeakIdKeyDictionary
@@ -309,14 +352,16 @@ class TensorWeakRef:
     ref: WeakRef[Tensor]
 
     def __init__(self, tensor: Tensor):
-        assert isinstance(tensor, Tensor)
+        if not isinstance(tensor, Tensor):
+            raise AssertionError(f"expected torch.Tensor, got {type(tensor)}.")
         self.ref = weakref.ref(tensor)
 
     def __call__(self):
         out = self.ref()
         if out is None:
             return out
-        assert isinstance(out, Tensor)
+        if not isinstance(out, Tensor):
+            raise AssertionError(f"expected torch.Tensor, got {type(out)}.")
         # TODO, add _fix_weakref type binding
         out._fix_weakref()  # type: ignore[attr-defined]
         return out

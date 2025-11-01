@@ -262,7 +262,12 @@ def is_exception_branch(branch: str) -> bool:
     """
     Branches that get opted out of experiments by default, until they're explicitly enabled.
     """
-    return branch.split("/")[0] in {"main", "nightly", "release", "landchecks"}
+    return branch.split("/", maxsplit=1)[0] in {
+        "main",
+        "nightly",
+        "release",
+        "landchecks",
+    }
 
 
 def load_yaml(yaml_text: str) -> Any:
@@ -623,9 +628,9 @@ def main() -> None:
             is_canary,
         )
 
-    except Exception:
-        log.exception(
-            "Failed to get issue. Defaulting to Meta runners and no experiments."
+    except Exception as e:
+        log.error(
+            f"Failed to get issue. Defaulting to Meta runners and no experiments. Exception: {e}"
         )
 
     set_github_output(GH_OUTPUT_KEY_LABEL_TYPE, runner_label_prefix)

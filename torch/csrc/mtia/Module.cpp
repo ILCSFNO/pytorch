@@ -10,6 +10,42 @@
 
 namespace torch::mtia {
 
+struct _MTIAGraph {
+  // MTIA use accelerator hooks to connect pytorch and outside.
+  // We need to provide the MTIAGraph class at Python layer, but the hooks only
+  // support hooking functions, not classes. Thus we store all MTIAGraph C++
+  // instances in a map, and use a handle to choose the right instance.
+  int64_t handle_;
+
+  _MTIAGraph(bool keep_graph = false)
+      : handle_(at::detail::getMTIAHooks().mtiagraphCreate(keep_graph)) {}
+  ~_MTIAGraph() = default;
+
+  void capture_begin(at::MempoolId_t pool) {
+    at::detail::getMTIAHooks().mtiagraphCaptureBegin(handle_, pool);
+  }
+
+  void capture_end() {
+    at::detail::getMTIAHooks().mtiagraphCaptureEnd(handle_);
+  }
+
+  void instantiate() {
+    at::detail::getMTIAHooks().mtiagraphInstantiate(handle_);
+  }
+
+  void replay() {
+    at::detail::getMTIAHooks().mtiagraphReplay(handle_);
+  }
+
+  void reset() {
+    at::detail::getMTIAHooks().mtiagraphReset(handle_);
+  }
+
+  at::MempoolId_t pool() {
+    return at::detail::getMTIAHooks().mtiagraphPool(handle_);
+  }
+};
+
 void initModule(PyObject* module) {
   auto m = py::handle(module).cast<py::module>();
 
@@ -63,6 +99,18 @@ void initModule(PyObject* module) {
     return at::detail::getMTIAHooks().getDefaultStream(device_index);
   });
 
+  m.def(
+      "_mtia_setStream",
+      [](int64_t stream_id,
+         c10::DeviceIndex device_index,
+         int64_t device_type) {
+        torch::utils::device_lazy_init(at::kMTIA);
+        at::detail::getMTIAHooks().setCurrentStream(c10::Stream::unpack3(
+            stream_id,
+            device_index,
+            static_cast<c10::DeviceType>(device_type)));
+      });
+
   m.def("_mtia_setCurrentStream", [](const c10::Stream& stream) {
     torch::utils::device_lazy_init(at::kMTIA);
     auto device = at::detail::getMTIAHooks().getCurrentDevice();
@@ -81,6 +129,12 @@ void initModule(PyObject* module) {
   m.def("_mtia_getDeviceCapability", [](c10::DeviceIndex device_index) {
     PyObject* raw_pyobject =
         at::detail::getMTIAHooks().getDeviceCapability(device_index);
+    return py::reinterpret_steal<py::object>(raw_pyobject);
+  });
+
+  m.def("_mtia_getDeviceProperties", [](c10::DeviceIndex device_index) {
+    PyObject* raw_pyobject =
+        at::detail::getMTIAHooks().getDeviceProperties(device_index);
     return py::reinterpret_steal<py::object>(raw_pyobject);
   });
 
@@ -113,6 +167,15 @@ void initModule(PyObject* module) {
   m.def("_mtia_resetPeakMemoryStats", [](c10::DeviceIndex device_index) {
     at::detail::getMTIAHooks().resetPeakMemoryStats(device_index);
   });
+
+  py::class_<_MTIAGraph>(m, "_MTIAGraph")
+      .def(py::init<bool>(), py::arg("keep_graph") = false)
+      .def("capture_begin", &_MTIAGraph::capture_begin)
+      .def("capture_end", &_MTIAGraph::capture_end)
+      .def("instantiate", &_MTIAGraph::instantiate)
+      .def("replay", &_MTIAGraph::replay)
+      .def("reset", &_MTIAGraph::reset)
+      .def("pool", &_MTIAGraph::pool);
 }
 
 } // namespace torch::mtia

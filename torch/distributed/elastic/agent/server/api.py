@@ -15,10 +15,11 @@ import time
 import traceback
 import warnings
 from collections import defaultdict
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Optional, Union
+from typing import Any, Optional, Union
 
 import torch.distributed.elastic.rendezvous as rdzv
 import torch.distributed.elastic.utils.store as store_util
@@ -27,6 +28,7 @@ from torch.distributed.elastic.metrics import prof, put_metric
 from torch.distributed.elastic.multiprocessing import ProcessFailure, SignalException
 from torch.distributed.elastic.rendezvous import RendezvousGracefulExitError
 from torch.distributed.elastic.utils.logging import get_logger
+from torch.numa.binding import NumaOptions
 
 
 __all__ = [
@@ -71,7 +73,12 @@ class WorkerSpec:
         tee: tees the specified std stream(s) to console + file,
              selectively tee for a particular local rank by passing a map,
              takes precedence over ``redirects`` settings.
-
+        event_log_handler: name of the event logging handler as registered in
+          `elastic/events/handlers.py <https://docs.pytorch.org/docs/stable/elastic/events.html>`_.
+        duplicate_stdout_filters: If non-empty, duplicates stdout to a file containing only lines
+                                 that match _any_ of the filter strings.
+        duplicate_stderr_filters: If non-empty, duplicates stderr to a file containing only lines
+                                 that match _any_ of the filter strings.
     """
 
     role: str
@@ -86,6 +93,10 @@ class WorkerSpec:
     master_port: Optional[int] = None
     master_addr: Optional[str] = None
     local_addr: Optional[str] = None
+    event_log_handler: str = "null"
+    numa_options: Optional[NumaOptions] = None
+    duplicate_stdout_filters: Optional[list[str]] = None
+    duplicate_stderr_filters: Optional[list[str]] = None
 
     def __post_init__(self):
         assert self.local_world_size > 0
@@ -95,6 +106,7 @@ class WorkerSpec:
             warnings.warn(
                 "WorkerSpec.fn will be deprecated,"
                 " please use WorkerSpec.entrypoint instead",
+                stacklevel=2,
                 category=DeprecationWarning,
             )
             self.entrypoint = self.fn
@@ -424,7 +436,7 @@ class ElasticAgent(abc.ABC):
 
         Note that the worker group is a mutable object and hence in a
         multi-threaded/process environment it may change state.
-        Implementors are encouraged (but not required) to return
+        Implementers are encouraged (but not required) to return
         a defensive read-only copy.
         """
         raise NotImplementedError
@@ -460,7 +472,7 @@ class SimpleElasticAgent(ElasticAgent):
     def _stop_workers(self, worker_group: WorkerGroup) -> None:
         r"""Stop all workers in the given worker group.
 
-        Implementors must deal with workers in all states defined by
+        Implementers must deal with workers in all states defined by
         ``WorkerState``. That is, it must gracefully handle stopping
         non-existent workers, unhealthy (stuck) workers, etc.
         """
@@ -498,8 +510,8 @@ class SimpleElasticAgent(ElasticAgent):
         group_rank = rdzv_info.rank
         group_world_size = rdzv_info.world_size
 
-        # master_addr/master_port could be explicitly overriden
-        # TODO: BC - specific to static rdzv and can be simplifed further
+        # master_addr/master_port could be explicitly overridden
+        # TODO: BC - specific to static rdzv and can be simplified further
         master_addr = spec.master_addr or rdzv_info.bootstrap_store_info.master_addr
         master_port = spec.master_port or rdzv_info.bootstrap_store_info.master_port
 
@@ -529,7 +541,8 @@ class SimpleElasticAgent(ElasticAgent):
             "  role_ranks=%(role_ranks)s\n"
             "  global_ranks=%(global_ranks)s\n"
             "  role_world_sizes=%(role_world_sizes)s\n"
-            "  global_world_sizes=%(global_world_sizes)s\n",
+            "  global_world_sizes=%(global_world_sizes)s\n"
+            "  event_log_handler=%(event_log_handler)s\n",
             {
                 "role": spec.role,
                 "restart_count": restart_count,
@@ -542,6 +555,7 @@ class SimpleElasticAgent(ElasticAgent):
                 "global_ranks": [worker.global_rank for worker in workers],
                 "role_world_sizes": [worker.role_world_size for worker in workers],
                 "global_world_sizes": [worker.world_size for worker in workers],
+                "event_log_handler": spec.event_log_handler,
             },
         )
 
@@ -683,7 +697,10 @@ class SimpleElasticAgent(ElasticAgent):
         for local_rank, w_id in worker_ids.items():
             worker = worker_group.workers[local_rank]
             worker.id = w_id
-            record(self._construct_event("START", EventSource.WORKER, worker))
+            record(
+                self._construct_event("START", EventSource.WORKER, worker),
+                worker_group.spec.event_log_handler,
+            )
 
         worker_group.state = WorkerState.HEALTHY
 
@@ -711,7 +728,7 @@ class SimpleElasticAgent(ElasticAgent):
             self._record_worker_events(result)
             return result
         except RendezvousGracefulExitError as e:
-            logger.info("Rendezvous gracefully exited: %s", e)
+            logger.info("Rendezvous gracefully exited: %s", e)  # noqa: G200
         except SignalException as e:
             logger.warning("Received %s death signal, shutting down workers", e.sigval)
             self._shutdown(e.sigval)
@@ -741,7 +758,19 @@ class SimpleElasticAgent(ElasticAgent):
             failure = result.failures.get(worker.global_rank)
             state: str = self._get_worker_state(worker, result)
             raw_error = json.dumps(failure.error_file_data) if failure else None
-            record(self._construct_event(state, EventSource.WORKER, worker, raw_error))
+            exit_code = failure.exitcode if failure else None
+            worker_pid = failure.pid if failure else None
+            record(
+                self._construct_event(
+                    state=state,
+                    source=EventSource.WORKER,
+                    worker=worker,
+                    raw_error=raw_error,
+                    exit_code=exit_code,
+                    worker_pid=worker_pid,
+                ),
+                self._worker_group.spec.event_log_handler,
+            )
 
     def _get_worker_state(self, worker: Worker, result: RunResult) -> str:
         failure = result.failures.get(worker.global_rank)
@@ -764,7 +793,8 @@ class SimpleElasticAgent(ElasticAgent):
             record(
                 self._construct_event(
                     state=state, source=EventSource.AGENT, duration_ms=duration_ms
-                )
+                ),
+                self._worker_group.spec.event_log_handler,
             )
 
     def _construct_event(
@@ -774,6 +804,8 @@ class SimpleElasticAgent(ElasticAgent):
         worker: Optional[Worker] = None,
         raw_error: Optional[str] = None,
         duration_ms: Optional[float] = None,
+        exit_code: Optional[int] = None,
+        worker_pid: Optional[int] = None,
     ) -> Event:
         wg = self._worker_group
         spec = wg.spec
@@ -785,6 +817,8 @@ class SimpleElasticAgent(ElasticAgent):
             md["local_rank"] = (worker.local_rank,)
             md["role_rank"] = (worker.role_rank,)
             md["role_world_size"] = (worker.role_world_size,)
+            md["exit_code"] = (exit_code,)
+            md["worker_pid"] = (worker_pid,)
             global_rank = worker.global_rank
             worker_id = str(worker.id)
         else:

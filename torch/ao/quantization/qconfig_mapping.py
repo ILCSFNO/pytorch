@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Any, Callable, Union
+from typing import Any, TYPE_CHECKING, Union
 
 import torch
 
@@ -24,6 +24,10 @@ from .qconfig import (
     QConfig,
     QConfigAny,
 )
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 __all__ = [
@@ -232,9 +236,9 @@ class QConfigMapping:
     def __init__(self) -> None:
         # In increasing match priority:
         self.global_qconfig: QConfigAny = None
-        self.object_type_qconfigs: OrderedDict[
-            Union[Callable, str], QConfigAny
-        ] = OrderedDict()
+        self.object_type_qconfigs: OrderedDict[Union[Callable, str], QConfigAny] = (
+            OrderedDict()
+        )
         self.module_name_regex_qconfigs: OrderedDict[str, QConfigAny] = OrderedDict()
         self.module_name_qconfigs: OrderedDict[str, QConfigAny] = OrderedDict()
         self.module_name_object_type_order_qconfigs: OrderedDict[

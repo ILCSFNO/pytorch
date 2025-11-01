@@ -1,7 +1,7 @@
 # mypy: allow-untyped-defs
 import functools
+from collections.abc import Callable
 from contextlib import contextmanager
-from typing import Callable
 
 import torch
 from torch._decomp import decomposition_table
@@ -72,8 +72,10 @@ def allow_smaller_batches(args, kwargs):
 
 @contextmanager
 def setup_rnn(use_input_variant, args, kwargs):
-    with batch_second(args, kwargs) if use_input_variant else allow_smaller_batches(
-        args, kwargs
+    with (
+        batch_second(args, kwargs)
+        if use_input_variant
+        else allow_smaller_batches(args, kwargs)
     ):
         yield
 
@@ -98,7 +100,7 @@ def implements_per_sample_grads(torch_function):
 # This is a __torch_function__ object but it could have also been a Tensor Extension
 # with a dispatch key.
 #
-# Needs to be a tensor subclass to allow reparamaterization
+# Needs to be a tensor subclass to allow reparameterization
 class ExpandedWeight(torch.Tensor):
     def __init__(self, orig_weight, batch_size, loss_reduction):
         self.batch_size = batch_size
@@ -129,14 +131,16 @@ class ExpandedWeight(torch.Tensor):
             # in aten, choosing the input or data variants is done by parsing logic. This mimics some of that
             decomp_opts = expanded_weights_rnn_decomps[func]
             use_input_variant = isinstance(
-                args[2], list
+                # pyrefly: ignore [index-error]
+                args[2],
+                list,
             )  # data variant uses a list here
             decomp = decomp_opts[0] if use_input_variant else decomp_opts[1]
 
             if decomp is not None:
                 with setup_rnn(use_input_variant, args, kwargs):
                     return decomp(*args, **kwargs)
-        if func == torch._cudnn_rnn_flatten_weight:
+        if func is torch._cudnn_rnn_flatten_weight:
             # since we aren't using the fused cuda kernels for RNNs, don't do this
             return
         if func in cls.handled_functions:
@@ -150,23 +154,23 @@ class ExpandedWeight(torch.Tensor):
         )
 
     @property
-    def dtype(self):
+    def dtype(self):  # type: ignore[override]
         return self.orig_weight.dtype
 
     @property
-    def data(self):
+    def data(self):  # type: ignore[override]
         return self.orig_weight.data
 
     @property
-    def shape(self):
+    def shape(self):  # type: ignore[override]
         return self.orig_weight.shape
 
     @property
-    def device(self):
+    def device(self):  # type: ignore[override]
         return self.orig_weight.device
 
     @property
-    def is_cuda(self):
+    def is_cuda(self):  # type: ignore[override]
         return self.orig_weight.is_cuda
 
     def data_ptr(self):

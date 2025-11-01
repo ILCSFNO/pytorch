@@ -1,5 +1,6 @@
 # mypy: allow-untyped-defs
-""" This module contains functions and classes that alter the behavior of torch.nn.functional.scaled_dot_product_attention """
+"""This module contains functions and classes that alter the behavior of torch.nn.functional.scaled_dot_product_attention"""
+
 import contextlib
 from collections.abc import Iterable
 from typing import Union
@@ -14,7 +15,11 @@ from torch.backends.cuda import (
 )
 
 
-__all__: list[str] = ["SDPBackend", "sdpa_kernel", "WARN_FOR_UNFUSED_KERNELS"]
+__all__: list[str] = [
+    "SDPBackend",
+    "sdpa_kernel",
+    "WARN_FOR_UNFUSED_KERNELS",
+]
 
 # Note: [SDPA warnings]
 # TODO: Consider using this for sdpa regardless of subclasses
@@ -26,9 +31,6 @@ __all__: list[str] = ["SDPBackend", "sdpa_kernel", "WARN_FOR_UNFUSED_KERNELS"]
 WARN_FOR_UNFUSED_KERNELS = False
 
 
-# Hacks for Sphinx documentation:
-# https://stackoverflow.com/questions/38765577/overriding-sphinx-autodoc-alias-of-for-import-of-private-class
-SDPBackend = SDPBackend
 r"""An enum-like class that contains the different backends for scaled dot product attention.
     This backend class is designed to be used with the sdpa_kernel context manager.
 
@@ -38,6 +40,7 @@ r"""An enum-like class that contains the different backends for scaled dot produ
         - FLASH_ATTENTION: The flash attention backend for scaled dot product attention.
         - EFFICIENT_ATTENTION: The efficient attention backend for scaled dot product attention.
         - CUDNN_ATTENTION: The cuDNN backend for scaled dot product attention.
+        - OVERRIDEABLE: The overridable backend for extension.
 
     See :func:`torch.nn.attention.sdpa_kernel` for more details.
 
@@ -54,10 +57,10 @@ def _raise_kernel_warnings(params: SDPAParams) -> None:
     """
     if WARN_FOR_UNFUSED_KERNELS:
         if not can_use_efficient_attention(params):
-            warn("Efficient attention can't be used because:")
+            warn("Efficient attention can't be used because:", stacklevel=2)
             can_use_efficient_attention(params, True)
         if not can_use_flash_attention(params):
-            warn("Flash attention can't be used because:")
+            warn("Flash attention can't be used because:", stacklevel=2)
             can_use_flash_attention(params, True)
 
 
@@ -66,6 +69,7 @@ _backend_names = {
     "flash": "FLASH_ATTENTION",
     "mem_efficient": "EFFICIENT_ATTENTION",
     "math": "MATH",
+    "overrideable": "OVERRIDEABLE",
 }
 
 
@@ -76,7 +80,7 @@ def _backend_from_string(name: str):
 def _cur_sdpa_kernel_backends(with_priority: bool = False):
     backends = []
     for name, val in _backend_names.items():
-        if getattr(torch.backends.cuda, f"{name}_sdp_enabled")():
+        if getattr(torch._C, f"_get_{name}_sdp_enabled")():
             backends.append(getattr(SDPBackend, val))
     if with_priority:
         curr_priority = torch._C._get_sdp_priority_order()
@@ -89,7 +93,7 @@ def _cur_sdpa_kernel_backends(with_priority: bool = False):
 def _sdpa_kernel(backends: Iterable, set_priority: bool = False):
     for name, val in _backend_names.items():
         enabled = getattr(SDPBackend, val) in backends
-        getattr(torch.backends.cuda, f"enable_{name}_sdp")(enabled)
+        getattr(torch._C, f"_set_sdp_use_{name}")(enabled)
     if set_priority:
         # backends should be a unique list
         user_priority = [int(backend) for backend in backends]
@@ -119,6 +123,7 @@ def sdpa_kernel(
 
         from torch.nn.functional import scaled_dot_product_attention
         from torch.nn.attention import SDPBackend, sdpa_kernel
+
         # Only enable flash attention backend
         with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             scaled_dot_product_attention(...)
@@ -130,9 +135,9 @@ def sdpa_kernel(
     This context manager can be used to select which backend to use for scaled dot product attention.
     Upon exiting the context manager, the previous state of the flags will be restored, enabling all backends.
     """
-    assert isinstance(
-        backends, (list, SDPBackend)
-    ), "Backend must be an instance of SDPBackend or a list of SDPBackend instances"
+    assert isinstance(backends, (list, SDPBackend)), (
+        "Backend must be an instance of SDPBackend or a list of SDPBackend instances"
+    )
 
     if isinstance(backends, SDPBackend):
         backends = [backends]

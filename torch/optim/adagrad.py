@@ -54,17 +54,17 @@ class Adagrad(Optimizer):
         if not 0.0 <= eps:
             raise ValueError(f"Invalid epsilon value: {eps}")
 
-        defaults = dict(
-            lr=lr,
-            lr_decay=lr_decay,
-            eps=eps,
-            weight_decay=weight_decay,
-            initial_accumulator_value=initial_accumulator_value,
-            foreach=foreach,
-            maximize=maximize,
-            differentiable=differentiable,
-            fused=fused,
-        )
+        defaults = {
+            "lr": lr,
+            "lr_decay": lr_decay,
+            "eps": eps,
+            "weight_decay": weight_decay,
+            "initial_accumulator_value": initial_accumulator_value,
+            "foreach": foreach,
+            "maximize": maximize,
+            "differentiable": differentiable,
+            "fused": fused,
+        }
         super().__init__(params, defaults)
 
         if fused:
@@ -117,6 +117,7 @@ class Adagrad(Optimizer):
                 )
 
     def share_memory(self):
+        """Calls tensor.share_memory_() on the state sum tensors."""
         for group in self.param_groups:
             for p in group["params"]:
                 state = self.state[p]
@@ -336,12 +337,15 @@ def _single_tensor_adagrad(
     differentiable: bool,
     has_complex: bool,
 ):
-    assert grad_scale is None and found_inf is None
+    if grad_scale is not None or found_inf is not None:
+        raise AssertionError("Expected grad_scale and found_inf to be None")
 
     if not torch.jit.is_scripting():
         lr = _to_scalar(lr)
 
-    for param, grad, state_sum, step_t in zip(params, grads, state_sums, state_steps):
+    for param, grad, state_sum, step_t in zip(
+        params, grads, state_sums, state_steps, strict=True
+    ):
         # update step
         step_t += 1
         step = _get_value(step_t)
@@ -401,8 +405,10 @@ def _multi_tensor_adagrad(
     differentiable: bool,
     has_complex: bool,
 ):
-    assert not differentiable, "_foreach ops don't support autograd"
-    assert grad_scale is None and found_inf is None
+    if differentiable:
+        raise AssertionError("_foreach ops don't support autograd")
+    if grad_scale is not None or found_inf is not None:
+        raise AssertionError("Expected grad_scale and found_inf to be None")
 
     # Foreach functions will throw errors if given empty lists
     if len(params) == 0:
@@ -466,7 +472,7 @@ def _multi_tensor_adagrad(
             torch._foreach_add_(device_state_steps, 1)
 
         if weight_decay != 0:
-            # Re-use the intermediate memory (device_grads) already allocated for maximize
+            # Reuse the intermediate memory (device_grads) already allocated for maximize
             if maximize:
                 torch._foreach_add_(device_grads, device_params, alpha=weight_decay)
             else:
@@ -484,7 +490,7 @@ def _multi_tensor_adagrad(
         torch._foreach_add_(std, eps)
 
         if weight_decay != 0 or maximize:
-            # Again, re-use the intermediate memory (device_grads) already allocated
+            # Again, reuse the intermediate memory (device_grads) already allocated
             torch._foreach_mul_(device_grads, minus_clr)
             numerator = device_grads
         else:

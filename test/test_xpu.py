@@ -1,5 +1,7 @@
 # Owner(s): ["module: intel"]
 
+import gc
+import re
 import subprocess
 import sys
 import tempfile
@@ -23,6 +25,7 @@ from torch.testing._internal.common_utils import (
     IS_LINUX,
     IS_WINDOWS,
     run_tests,
+    serialTest,
     suppress_warnings,
     TEST_XPU,
     TestCase,
@@ -100,6 +103,7 @@ class TestXpu(TestCase):
         self.assertEqual(device_name, torch.xpu.get_device_name())
 
         device_capability = torch.xpu.get_device_capability(current_device)
+        self.assertTrue(device_capability["device_id"] > 0)
         self.assertTrue(device_capability["max_work_group_size"] > 0)
         self.assertTrue(device_capability["max_num_sub_groups"] > 0)
         self.assertEqual(
@@ -131,6 +135,10 @@ class TestXpu(TestCase):
                 device_properties.architecture,
                 device_capability["architecture"],
             )
+        self.assertEqual(
+            len(str(device_properties.uuid)), 36
+        )  # xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+        self.assertEqual(len(device_properties.uuid.bytes), 16)
 
     @unittest.skipIf(IS_WINDOWS, "not applicable to Windows (only fails with fork)")
     def test_wrong_xpu_fork(self):
@@ -247,7 +255,7 @@ if __name__ == "__main__":
         stream.record_event(end_event)
         torch.xpu.synchronize()
         if int(torch.version.xpu) >= 20250000:
-            start_event.elapsed_time(end_event)
+            self.assertGreater(start_event.elapsed_time(end_event), 0)
         else:
             with self.assertRaisesRegex(
                 NotImplementedError,
@@ -298,7 +306,7 @@ if __name__ == "__main__":
         self.assertNotEqual(event1.event_id, event2.event_id)
         self.assertEqual(c_xpu.cpu(), a + b)
         if int(torch.version.xpu) >= 20250000:
-            event1.elapsed_time(event2)
+            self.assertGreater(event1.elapsed_time(event2), 0)
         else:
             with self.assertRaisesRegex(
                 NotImplementedError,
@@ -475,6 +483,35 @@ if __name__ == "__main__":
         with self.assertRaises(torch.OutOfMemoryError):
             torch.empty(1024 * 1024 * 1024 * 1024, device="xpu")
 
+    @serialTest()
+    def test_set_per_process_memory_fraction(self):
+        gc.collect()
+        torch.xpu.empty_cache()
+        total_memory = torch.xpu.get_device_properties().total_memory
+        fraction = 0.5
+        orig_fraction = torch.xpu.get_per_process_memory_fraction()
+        with self.assertRaisesRegex(ValueError, "invalid fraction:"):
+            torch.xpu.set_per_process_memory_fraction(-0.1)
+        with self.assertRaisesRegex(ValueError, "invalid fraction:"):
+            torch.xpu.set_per_process_memory_fraction(1.1)
+
+        torch.xpu.set_per_process_memory_fraction(fraction)
+        allowed_memory = int(total_memory * 0.49)
+        reserved_memory = torch.xpu.memory_reserved()
+        application_memory = allowed_memory - reserved_memory
+        tensor = torch.empty(application_memory, dtype=torch.int8, device="xpu")
+        del tensor
+        gc.collect()
+        torch.xpu.empty_cache()
+
+        self.assertEqual(fraction, torch.xpu.get_per_process_memory_fraction())
+
+        application_memory = int(total_memory * 0.51)
+        with self.assertRaises(torch.OutOfMemoryError):
+            _ = torch.empty(application_memory, dtype=torch.int8, device="xpu")
+
+        torch.xpu.set_per_process_memory_fraction(orig_fraction)
+
     def test_memory_allocation(self):
         torch.xpu.empty_cache()
         prev_allocated = torch.xpu.memory_allocated()
@@ -518,6 +555,42 @@ if __name__ == "__main__":
         )
         del a
 
+    def test_memory_stats(self):
+        gc.collect()
+        torch.xpu.empty_cache()
+        torch.xpu.reset_peak_memory_stats()
+        torch.xpu.reset_accumulated_memory_stats()
+        prev_allocated = torch.accelerator.memory_allocated()
+        prev_reserved = torch.accelerator.memory_reserved()
+        prev_max_allocated = torch.accelerator.max_memory_allocated()
+        prev_max_reserved = torch.accelerator.max_memory_reserved()
+        self.assertEqual(prev_allocated, prev_max_allocated)
+        self.assertEqual(prev_reserved, prev_max_reserved)
+        # Activate 1kB memory
+        prev_active_current = torch.accelerator.memory_stats()[
+            "active_bytes.all.current"
+        ]
+        tmp = torch.randn(256, device="xpu")
+        # Detect if the current active memory is 1kB
+        self.assertEqual(
+            torch.accelerator.memory_stats()["active_bytes.all.current"],
+            1024 + prev_active_current,
+        )
+        self.assertEqual(torch.accelerator.memory_stats()["active_bytes.all.freed"], 0)
+        del tmp
+        gc.collect()
+        torch.accelerator.empty_cache()
+        self.assertEqual(
+            torch.accelerator.memory_stats()["active_bytes.all.current"],
+            prev_active_current,
+        )
+        self.assertEqual(
+            torch.accelerator.memory_stats()["active_bytes.all.freed"], 1024
+        )
+        torch.accelerator.reset_peak_memory_stats()
+        self.assertEqual(torch.accelerator.max_memory_allocated(), prev_max_allocated)
+        self.assertEqual(torch.accelerator.max_memory_reserved(), prev_max_reserved)
+
     @skipXPUIf(
         int(torch.version.xpu) < 20250000,
         "Test requires SYCL compiler version 2025.0.0 or newer.",
@@ -542,6 +615,16 @@ if __name__ == "__main__":
         for arch in arch_list:
             self.assertTrue(arch in flags)
 
+    @unittest.skipIf(not TEST_MULTIXPU, "only one GPU detected")
+    def test_can_device_access_peer(self):
+        device_count = torch.xpu.device_count()
+        for device in range(device_count):
+            for peer in range(device_count):
+                self.assertEqual(
+                    torch.xpu.can_device_access_peer(device, peer),
+                    torch.xpu.can_device_access_peer(peer, device),
+                )
+
     def test_torch_version_xpu(self):
         self.assertEqual(len(torch.version.xpu), 8)
         compiler_version = int(torch.version.xpu)
@@ -550,15 +633,10 @@ if __name__ == "__main__":
             library = find_library_location("libtorch_xpu.so")
             cmd = f"ldd {library} | grep libsycl"
             results = subprocess.check_output(cmd, shell=True).strip().split(b"\n")
-            # There should be only one libsycl.so or libsycl-preview.so
+            # There should be only one libsycl.so
             self.assertEqual(len(results), 1)
             for result in results:
-                if b"libsycl.so" in result:
-                    self.assertGreaterEqual(compiler_version, 20250000)
-                elif b"libsycl-preview.so" in result:
-                    self.assertLess(compiler_version, 20250000)
-                else:
-                    self.fail("Unexpected libsycl library")
+                self.assertTrue(b"libsycl.so" in result)
 
     def test_dlpack_conversion(self):
         x = make_tensor((5,), dtype=torch.float32, device="xpu")
@@ -728,9 +806,31 @@ class TestXPUAPISanity(TestCase):
             torch.xpu.is_available(),
         )
 
+    def test_is_tf32_supported(self):
+        if not torch.xpu.is_available():
+            self.assertFalse(torch.xpu.is_tf32_supported())
+
     def test_get_arch_list(self):
         if not torch.xpu._is_compiled():
             self.assertEqual(len(torch.xpu.get_arch_list()), 0)
+
+    def test_torch_config_for_xpu(self):
+        config = torch.__config__.show()
+        value = re.search(r"USE_XPU=([^,]+)", config)
+        self.assertIsNotNone(value)
+        if torch.xpu._is_compiled():
+            self.assertTrue(value.group(1) in ["ON", "1"])
+            value = re.search(r"USE_XCCL=([^,]+)", config)
+            if torch.distributed.is_xccl_available():
+                self.assertTrue(value.group(1) in ["ON", "1"])
+            else:
+                self.assertTrue(value.group(1) in ["OFF", "0"])
+        else:
+            self.assertTrue(value.group(1) in ["OFF", "0"])
+            self.assertFalse(torch.distributed.is_xccl_available())
+            value = re.search(r"USE_XCCL=([^,]+)", config)
+            self.assertIsNotNone(value)
+            self.assertTrue(value.group(1) in ["OFF", "0"])
 
 
 if __name__ == "__main__":

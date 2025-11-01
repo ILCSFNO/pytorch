@@ -2,7 +2,8 @@
 import torch
 from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
 from .module_tracker import ModuleTracker
-from typing import Any, Optional, Union, TypeVar, Callable
+from typing import Any, Optional, Union, TypeVar
+from collections.abc import Callable
 from collections.abc import Iterator
 from typing_extensions import ParamSpec
 from collections import defaultdict
@@ -61,7 +62,8 @@ def mm_flop(a_shape, b_shape, *args, out_shape=None, **kwargs) -> int:
     # Inputs contains the shapes of two matrices.
     m, k = a_shape
     k2, n = b_shape
-    assert k == k2
+    if k != k2:
+        raise AssertionError(f"matmul: inner dimensions must match (k == k2), got {k} and {k2}")
     # NB(chilli): Should be 2 * k - 1 technically for FLOPs.
     return m * n * 2 * k
 
@@ -77,8 +79,10 @@ def bmm_flop(a_shape, b_shape, out_shape=None, **kwargs) -> int:
     # Inputs contains the shapes of two tensor.
     b, m, k = a_shape
     b2, k2, n = b_shape
-    assert b == b2
-    assert k == k2
+    if b != b2:
+        raise AssertionError(f"bmm: batch dimensions must match (b == b2), got {b} and {b2}")
+    if k != k2:
+        raise AssertionError(f"bmm: inner dimensions must match (k == k2), got {k} and {k2}")
     # NB(chilli): Should be 2 * k - 1 technically for FLOPs.
     flop = b * m * n * 2 * k
     return flop
@@ -127,7 +131,6 @@ def conv_flop_count(
     Returns:
         int: the number of flops
     """
-
     batch_size = x_shape[0]
     conv_shape = (x_shape if transposed else out_shape)[2:]
     c_out, c_in, *filter_size = w_shape
@@ -146,9 +149,10 @@ def conv_flop_count(
     flop = prod(conv_shape) * prod(filter_size) * batch_size * c_out * c_in * 2
     return flop
 
-@register_flop_formula([aten.convolution, aten._convolution])
+@register_flop_formula([aten.convolution, aten._convolution, aten.cudnn_convolution, aten._slow_conv2d_forward])
 def conv_flop(x_shape, w_shape, _bias, _stride, _padding, _dilation, transposed, *args, out_shape=None, **kwargs) -> int:
     """Count flops for convolution."""
+    # pyrefly: ignore [bad-argument-type]
     return conv_flop_count(x_shape, w_shape, out_shape, transposed=transposed)
 
 
@@ -265,7 +269,8 @@ def sdpa_flop_count(query_shape, key_shape, value_shape):
     b, h, s_q, d_q = query_shape
     _b2, _h2, s_k, _d2 = key_shape
     _b3, _h3, _s3, d_v = value_shape
-    assert b == _b2 == _b3 and h == _h2 == _h3 and d_q == _d2 and s_k == _s3 and d_q == _d2
+    if not b == _b2 == _b3 or not h == _h2 == _h3 or not d_q == _d2 or not s_k == _s3 or not d_q == _d2:
+        raise AssertionError("sdpa_flop_count: query/key/value shapes are incompatible")
     total_flops = 0
     # q: [b, h, s_q, d_q] @ k: [b, h, d_q, s_k] -> scores: [b, h, s_q, s_k]
     total_flops += bmm_flop((b * h, s_q, d_q), (b * h, d_q, s_k))
@@ -319,18 +324,24 @@ def _unpack_flash_attention_nested_shapes(
         # In comparison, non-Nested inputs have shape (batch, heads, sequence len, dimension)
         # To deal with this, we convert to a shape of (batch, heads, max_seq_len, dimension)
         # So the flops calculation in this case is an overestimate of the actual flops.
-        assert len(key.shape) == 3
-        assert len(value.shape) == 3
-        assert grad_out is None or grad_out.shape == query.shape
+        if len(key.shape) != 3:
+            raise AssertionError("sdpa_flop_count: expected key.shape to be 3-dimensional")
+        if len(value.shape) != 3:
+            raise AssertionError("sdpa_flop_count: expected value.shape to be 3-dimensional")
+        if grad_out is not None and grad_out.shape != query.shape:
+            raise AssertionError("sdpa_flop_count: grad_out.shape must match query.shape when provided")
         _, h_q, d_q = query.shape
         _, h_k, d_k = key.shape
         _, h_v, d_v = value.shape
-        assert cum_seq_q is not None
-        assert cum_seq_k is not None
-        assert cum_seq_q.shape == cum_seq_k.shape
+        if cum_seq_q is None:
+            raise AssertionError("sdpa_flop_count: cum_seq_q must not be None")
+        if cum_seq_k is None:
+            raise AssertionError("sdpa_flop_count: cum_seq_k must not be None")
+        if cum_seq_q.shape != cum_seq_k.shape:
+            raise AssertionError("sdpa_flop_count: cum_seq_q and cum_seq_k must have the same shape")
         seq_q_lengths = _offsets_to_lengths(cum_seq_q, max_q)
         seq_k_lengths = _offsets_to_lengths(cum_seq_k, max_k)
-        for (seq_q_len, seq_k_len) in zip(seq_q_lengths, seq_k_lengths):
+        for (seq_q_len, seq_k_len) in zip(seq_q_lengths, seq_k_lengths, strict=True):
             new_query_shape = (1, h_q, seq_q_len, d_q)
             new_key_shape = (1, h_k, seq_k_len, d_k)
             new_value_shape = (1, h_v, seq_k_len, d_v)
@@ -367,18 +378,25 @@ def _unpack_efficient_attention_nested_shapes(
         # In comparison, non-Nested inputs have shape (batch, heads, sequence len, dimension)
         # To deal with this, we convert to a shape of (batch, heads, max_seq_len, dimension)
         # So the flops calculation in this case is an overestimate of the actual flops.
-        assert len(key.shape) == 4
-        assert len(value.shape) == 4
-        assert grad_out is None or grad_out.shape == query.shape
+        if len(key.shape) != 4:
+            raise AssertionError("_unpack_efficient_attention_nested_shapes: expected key.shape to be 4-dimensional")
+        if len(value.shape) != 4:
+            raise AssertionError("_unpack_efficient_attention_nested_shapes: expected value.shape to be 4-dimensional")
+        if grad_out is not None and grad_out.shape != query.shape:
+            raise AssertionError("_unpack_efficient_attention_nested_shapes: grad_out.shape must match query.shape when provided")
         _, _, h_q, d_q = query.shape
         _, _, h_k, d_k = key.shape
         _, _, h_v, d_v = value.shape
-        assert cu_seqlens_q is not None
-        assert cu_seqlens_k is not None
-        assert cu_seqlens_q.shape == cu_seqlens_k.shape
+        if cu_seqlens_q is None:
+            raise AssertionError("_unpack_efficient_attention_nested_shapes: cu_seqlens_q must not be None")
+        if cu_seqlens_k is None:
+            raise AssertionError("_unpack_efficient_attention_nested_shapes: cu_seqlens_k must not be None")
+        if cu_seqlens_q.shape != cu_seqlens_k.shape:
+            raise AssertionError("_unpack_efficient_attention_nested_shapes: "
+                                 "cu_seqlens_q and cu_seqlens_k must have the same shape")
         seqlens_q = _offsets_to_lengths(cu_seqlens_q, max_seqlen_q)
         seqlens_k = _offsets_to_lengths(cu_seqlens_k, max_seqlen_k)
-        for len_q, len_k in zip(seqlens_q, seqlens_k):
+        for len_q, len_k in zip(seqlens_q, seqlens_k, strict=True):
             new_query_shape = (1, h_q, len_q, d_q)
             new_key_shape = (1, h_k, len_k, d_k)
             new_value_shape = (1, h_v, len_k, d_v)
@@ -459,8 +477,10 @@ def sdpa_backward_flop_count(grad_out_shape, query_shape, key_shape, value_shape
     _b2, _h2, s_k, _d2 = key_shape
     _b3, _h3, _s3, d_v = value_shape
     _b4, _h4, _s4, _d4 = grad_out_shape
-    assert b == _b2 == _b3 == _b4 and h == _h2 == _h3 == _h4 and d_q == _d2
-    assert d_v == _d4 and s_k == _s3 and s_q == _s4
+    if not b == _b2 == _b3 == _b4 or not h == _h2 == _h3 == _h4 or not d_q == _d2:
+        raise AssertionError("sdpa_backward_flop_count: batch/heads/dimension mismatch among tensors")
+    if not d_v == _d4 or not s_k == _s3 or not s_q == _s4:
+        raise AssertionError("sdpa_backward_flop_count: grad_out/value/key/query shapes are incompatible")
     total_flops = 0
     # Step 1: We recompute the scores matrix.
     # q: [b, h, s_q, d_q] @ k: [b, h, d_q, s_k] -> scores: [b, h, s_q, s_k]
@@ -561,6 +581,8 @@ flop_registry = {
     aten._scaled_mm: _scaled_mm_flop,
     aten.convolution: conv_flop,
     aten._convolution: conv_flop,
+    aten.cudnn_convolution: conv_flop,
+    aten._slow_conv2d_forward: conv_flop,
     aten.convolution_backward: conv_backward_flop,
     aten._scaled_dot_product_efficient_attention: sdpa_flop,
     aten._scaled_dot_product_flash_attention: sdpa_flop,
@@ -674,7 +696,9 @@ class FlopCounterMode:
         if depth is None:
             depth = 999999
 
+
         import tabulate
+
         tabulate.PRESERVE_WHITESPACE = True
         header = ["Module", "FLOP", "% Total"]
         values = []
@@ -737,7 +761,8 @@ class FlopCounterMode:
         return self
 
     def __exit__(self, *args):
-        assert self.mode is not None
+        if self.mode is None:
+            raise AssertionError("Internal error: FlopCounter.__exit__ called but mode is None")
         b = self.mode.__exit__(*args)
         self.mode = None  # break cycles
         self.mod_tracker.__exit__()
@@ -754,16 +779,87 @@ class FlopCounterMode:
 
         return out
 
-
 class _FlopCounterMode(TorchDispatchMode):
+    supports_higher_order_operators = True
+
     def __init__(self, counter: FlopCounterMode):
         self.counter = counter
+
+    def _execute_with_isolated_flop_counting(self, branch_fn, operands):
+        """Execute a branch function and capture its FLOP counts without
+        affecting self.counter.flop_counts
+
+        Args:
+            branch_fn: The branch function to execute
+            operands: Arguments to pass to the branch function
+
+        Returns:
+            Tuple of (result, flop_counts) where result is the branch output
+            and flop_counts is a copy of the FLOP counts after execution
+        """
+        import copy
+        checkpointed_flop_counts = copy.copy(self.counter.flop_counts)
+        with self:
+            result = branch_fn(*operands)
+        flop_counts = copy.copy(self.counter.flop_counts)
+        self.counter.flop_counts = checkpointed_flop_counts
+        return result, flop_counts
+
+    def _handle_higher_order_ops(self, func, types, args, kwargs):
+        if func is not torch.ops.higher_order.cond:
+            return NotImplemented
+
+        # The flop counter for cond counts the upper bound of flops.
+        # For example, if a matmul is executed 2 times in true branch
+        # but only 1 time in the false branch, the flop counter will
+        # record the larger number of flops, i.e. 2 times.
+        if func is torch.ops.higher_order.cond:
+
+            pred, true_branch, false_branch, operands = args
+            # Step 1: Count flops for true branch and false branch separately
+            true_out, true_flop_counts = self._execute_with_isolated_flop_counting(
+                true_branch, operands
+            )
+            if true_out is NotImplemented:
+                return NotImplemented
+
+            false_out, false_flop_counts = self._execute_with_isolated_flop_counting(
+                false_branch, operands
+            )
+            if false_out is NotImplemented:
+                return NotImplemented
+
+            # Step 2: merge flop counts
+            all_mod_keys = set(true_flop_counts.keys()) | set(false_flop_counts.keys())
+            merged_flop_counts = {}
+            for outer_key in all_mod_keys:
+                true_func_counts = true_flop_counts[outer_key]
+                false_func_counts = false_flop_counts[outer_key]
+
+                merged_func_counts = {}
+                all_func_keys = set(true_func_counts.keys()) | set(false_func_counts.keys())
+
+                for func_key in all_func_keys:
+                    true_val = true_func_counts.get(func_key, 0)
+                    false_val = false_func_counts.get(func_key, 0)
+                    merged_func_counts[func_key] = max(true_val, false_val)
+
+                merged_flop_counts[outer_key] = merged_func_counts
+
+            # Step 3: update the counter with merged counts
+            for outer_key, inner_dict in merged_flop_counts.items():
+                self.counter.flop_counts[outer_key].update(inner_dict)
+
+            # It doesn't matter which one we return since true_fn and false_fn return
+            # output with the same structure.
+            return true_out
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs if kwargs else {}
 
         # Skip ops from non-standard dispatch_sizes_strides_policy such as NJT
-        if func in {torch.ops.aten.is_contiguous.default,
+        if func in {torch.ops.aten.sym_is_contiguous.default,
+                    torch.ops.aten.is_contiguous.default,
                     torch.ops.aten.is_contiguous.memory_format,
                     torch.ops.aten.is_strides_like_format.default,
                     torch.ops.aten.is_non_overlapping_and_dense.default,
@@ -779,6 +875,9 @@ class _FlopCounterMode(TorchDispatchMode):
                     torch.ops.prim.layout.default}:
 
             return NotImplemented
+
+        if isinstance(func, torch._ops.HigherOrderOperator):
+            return self._handle_higher_order_ops(func, types, args, kwargs)
 
         # If we don't have func in flop_registry, see if it can decompose
         if func not in self.counter.flop_registry and func is not torch.ops.prim.device.default:

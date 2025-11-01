@@ -32,7 +32,7 @@ class DataNormSparsifier(BaseDataSparsifier):
         zeros_per_block: Number of zeros in a sparse block
     Note::
         All arguments to the DataNormSparsifier constructor are "default"
-        arguments and could be overriden by the configuration provided in the
+        arguments and could be overridden by the configuration provided in the
         `add_data` step.
     """
 
@@ -47,7 +47,8 @@ class DataNormSparsifier(BaseDataSparsifier):
         if zeros_per_block is None:
             zeros_per_block = reduce(operator.mul, sparse_block_shape)
 
-        assert norm in ["L1", "L2"], "only L1 and L2 norm supported at the moment"
+        if norm not in ["L1", "L2"]:
+            raise AssertionError("only L1 and L2 norm supported at the moment")
 
         defaults = {
             "sparsity_level": sparsity_level,

@@ -1,8 +1,8 @@
 import logging
 import warnings
-from collections.abc import Collection, Mapping
+from collections.abc import Callable, Collection, Mapping
 from copy import deepcopy
-from typing import Any, Callable, Optional, overload, Union
+from typing import Any, Optional, overload, Union
 
 import torch
 import torch.nn as nn
@@ -87,7 +87,8 @@ class _NamedOptimizer(optim.Optimizer):
         else:
             warnings.warn(
                 "Since we pass in param_groups, we will use param_groups to "
-                "initialize the optimizer, not all parameters of the module."
+                "initialize the optimizer, not all parameters of the module.",
+                stacklevel=2,
             )
             param_to_key = {param: key for key, param in self.named_parameters.items()}  # type: ignore[misc, has-type]
             ordered_param_keys = []
@@ -323,5 +324,5 @@ class _NamedOptimizer(optim.Optimizer):
 
 
 def _gen_param_group_key(param_keys: list[str]) -> str:
-    """Concatenate all param keys as a unique indentifier for one param group."""
+    """Concatenate all param keys as a unique identifier for one param group."""
     return "/".join(sorted(param_keys))

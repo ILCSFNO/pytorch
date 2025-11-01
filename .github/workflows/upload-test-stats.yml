@@ -6,6 +6,7 @@ on:
       - pull
       - trunk
       - periodic
+      - periodic-rocm-mi200
       - periodic-rocm-mi300
       - inductor
       - unstable
@@ -14,6 +15,7 @@ on:
       - inductor-periodic
       - rocm
       - rocm-mi300
+      - rocm-mi355
       - inductor-micro-benchmark
       - inductor-micro-benchmark-x86
       - inductor-cu124

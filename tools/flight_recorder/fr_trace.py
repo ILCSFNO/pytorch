@@ -14,7 +14,7 @@ Not Yet Implemented
 - TODO- tracebacks aren't implemented
 
 Known Issues
-- Flight Recorder buffer sequence_id information is not sufficient to match collectives and coalseced collectives
+- Flight Recorder buffer sequence_id information is not sufficient to match collectives and coalesced collectives
   unless we have the trace data from the beginning of the program.  To enable confident analysis of trace buffers that
   do not start from zero (and to simplify the script's matching logic) we need to add more information to the recorder.
 - Currently, the script omits checking the 'status' of collectives.  We can look for the first 'non completed'
@@ -32,7 +32,7 @@ import pickle
 from collections.abc import Sequence
 from typing import Optional
 
-from tools.flight_recorder.components.builder import build_db
+from tools.flight_recorder.components.builder import build_db, transform_ft
 from tools.flight_recorder.components.config_manager import JobConfig
 from tools.flight_recorder.components.loader import read_dir
 from tools.flight_recorder.components.types import types
@@ -40,11 +40,20 @@ from tools.flight_recorder.components.types import types
 
 def main(args: Optional[Sequence[str]] = None) -> None:
     config = JobConfig()
+    # pyrefly: ignore [bad-assignment]
     args = config.parse_args(args)
+    # pyrefly: ignore [missing-attribute]
     assert args.trace_dir, "Trace directory trace_dir is required"
+    # pyrefly: ignore [bad-argument-type]
     details, version = read_dir(args)
+    if args.transform_ft:
+        assert args.group_world_size, "World size is required for transform_ft"
+        details = transform_ft(details, args.group_world_size)
+    # pyrefly: ignore [bad-argument-type]
     db = build_db(details, args, version)
+    # pyrefly: ignore [missing-attribute]
     if args.output:
+        # pyrefly: ignore [no-matching-overload]
         with open(args.output, "wb") as f:
             pickle.dump((types, db), f)
 

@@ -64,7 +64,7 @@ class _InstanceNorm(_NormBase):
         missing_keys,
         unexpected_keys,
         error_msgs,
-    ):
+    ) -> None:
         version = local_metadata.get("version", None)
         # at version 1: removed running_mean and running_var when
         # track_running_stats=False (default)
@@ -115,7 +115,8 @@ class _InstanceNorm(_NormBase):
                 warnings.warn(
                     f"input's size at dim={feature_dim} does not match num_features. "
                     "You can silence this warning by not passing in num_features, "
-                    "which is not used because affine=False"
+                    "which is not used because affine=False",
+                    stacklevel=2,
                 )
 
         if input.dim() == self._get_no_batch_dim():
@@ -193,10 +194,10 @@ class InstanceNorm1d(_InstanceNorm):
         >>> output = m(input)
     """
 
-    def _get_no_batch_dim(self):
+    def _get_no_batch_dim(self) -> int:
         return 2
 
-    def _check_input_dim(self, input):
+    def _check_input_dim(self, input) -> None:
         if input.dim() not in (2, 3):
             raise ValueError(f"expected 2D or 3D input (got {input.dim()}D input)")
 
@@ -230,10 +231,10 @@ class LazyInstanceNorm1d(_LazyNormBase, _InstanceNorm):
 
     cls_to_become = InstanceNorm1d  # type: ignore[assignment]
 
-    def _get_no_batch_dim(self):
+    def _get_no_batch_dim(self) -> int:
         return 2
 
-    def _check_input_dim(self, input):
+    def _check_input_dim(self, input) -> None:
         if input.dim() not in (2, 3):
             raise ValueError(f"expected 2D or 3D input (got {input.dim()}D input)")
 
@@ -309,10 +310,10 @@ class InstanceNorm2d(_InstanceNorm):
         >>> output = m(input)
     """
 
-    def _get_no_batch_dim(self):
+    def _get_no_batch_dim(self) -> int:
         return 3
 
-    def _check_input_dim(self, input):
+    def _check_input_dim(self, input) -> None:
         if input.dim() not in (3, 4):
             raise ValueError(f"expected 3D or 4D input (got {input.dim()}D input)")
 
@@ -347,10 +348,10 @@ class LazyInstanceNorm2d(_LazyNormBase, _InstanceNorm):
 
     cls_to_become = InstanceNorm2d  # type: ignore[assignment]
 
-    def _get_no_batch_dim(self):
+    def _get_no_batch_dim(self) -> int:
         return 3
 
-    def _check_input_dim(self, input):
+    def _check_input_dim(self, input) -> None:
         if input.dim() not in (3, 4):
             raise ValueError(f"expected 3D or 4D input (got {input.dim()}D input)")
 
@@ -425,10 +426,10 @@ class InstanceNorm3d(_InstanceNorm):
         >>> output = m(input)
     """
 
-    def _get_no_batch_dim(self):
+    def _get_no_batch_dim(self) -> int:
         return 4
 
-    def _check_input_dim(self, input):
+    def _check_input_dim(self, input) -> None:
         if input.dim() not in (4, 5):
             raise ValueError(f"expected 4D or 5D input (got {input.dim()}D input)")
 
@@ -463,9 +464,9 @@ class LazyInstanceNorm3d(_LazyNormBase, _InstanceNorm):
 
     cls_to_become = InstanceNorm3d  # type: ignore[assignment]
 
-    def _get_no_batch_dim(self):
+    def _get_no_batch_dim(self) -> int:
         return 4
 
-    def _check_input_dim(self, input):
+    def _check_input_dim(self, input) -> None:
         if input.dim() not in (4, 5):
             raise ValueError(f"expected 4D or 5D input (got {input.dim()}D input)")

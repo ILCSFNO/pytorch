@@ -156,8 +156,8 @@ class TestJointOps(TestCase):
             "Pure python equivalent of isdisjoint()"
             return not OrderedSet(s1).intersection(s2)
 
-        for larg in "", "a", "ab", "abc", "ababac", "cdc", "cc", "efgfe", "ccb", "ef":
-            s1 = self.thetype(larg)
+        for large in "", "a", "ab", "abc", "ababac", "cdc", "cc", "efgfe", "ccb", "ef":
+            s1 = self.thetype(large)
             for rarg in (
                 "",
                 "a",
@@ -235,7 +235,8 @@ class TestJointOps(TestCase):
         self.assertRaises(TypeError, self.s.symmetric_difference, [[]])
         for C in OrderedSet, frozenset, dict.fromkeys, str, list, tuple:
             self.assertEqual(
-                self.thetype("abcba").symmetric_difference(C("cdc")), OrderedSet("abd")
+                self.thetype("abcba").symmetric_difference(C("cdc")),
+                OrderedSet("abd"),  # codespell:ignore
             )
             self.assertEqual(
                 self.thetype("abcba").symmetric_difference(C("efgfe")),
@@ -538,7 +539,7 @@ class TestSet(TestJointOps, TestCase):
         # s.discard(self.thetype(self.word))
 
     def test_pop(self):
-        for i in range(len(self.s)):
+        for _ in range(len(self.s)):
             elem = self.s.pop()
             self.assertNotIn(elem, self.s)
         self.assertRaises(KeyError, self.s.pop)
@@ -651,7 +652,7 @@ class TestSet(TestJointOps, TestCase):
         )
         self.assertRaises(TypeError, self.s.symmetric_difference_update, [[]])
         for p, q in (
-            ("cdc", "abd"),
+            ("cdc", "abd"),  # codespell:ignore
             ("efgfe", "abcefg"),
             ("ccb", "a"),
             ("ef", "abcef"),
@@ -989,8 +990,8 @@ class TestExceptionPropagation(TestCase):
     def test_changingSizeWhileIterating(self):
         s = OrderedSet([1, 2, 3])
         try:
-            for i in s:
-                s.update([4])
+            for _ in s:
+                s.update([4])  # noqa: B909
         except RuntimeError:
             pass
         else:

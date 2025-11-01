@@ -31,16 +31,10 @@
 
 #include <c10/macros/Macros.h>
 
-#if CUB_SUPPORTS_SCAN_BY_KEY()
 #include <thrust/iterator/reverse_iterator.h>
-#endif
 
 namespace at::native {
 
-#if !CUB_SUPPORTS_SCAN_BY_KEY()
-template<typename index_t>
-void embedding_dense_backward_cuda_scan(Tensor &sorted_indices, Tensor &count);
-#endif
 
 namespace {
 
@@ -199,7 +193,6 @@ Tensor embedding_bag_backward_cuda_sum_avg(
 
   if (scale_grad_by_freq) {
     count = at::empty_like(indices, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
-#if CUB_SUPPORTS_SCAN_BY_KEY()
     AT_DISPATCH_INDEX_TYPES(indices.scalar_type(), "embedding_bag_backward_cuda_sum_avg", [&] () {
       cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -210,7 +203,7 @@ Tensor embedding_bag_backward_cuda_sum_avg(
       auto count_data = count.mutable_data_ptr<index_t>();
       cuda::cub::inclusive_sum_by_key(
         sorted_data,
-        NO_ROCM(at_cuda_detail)ROCM_HIPCUB(::cub)::ConstantInputIterator<index_t>(1),
+        ATEN_CUB_CONSTANT_ITERATOR(index_t)(1),
         count_data,
         num_indices
       );
@@ -222,15 +215,10 @@ Tensor embedding_bag_backward_cuda_sum_avg(
         thrust::make_reverse_iterator(sorted_data + num_indices),
         thrust::make_reverse_iterator(count_data + num_indices),
         thrust::make_reverse_iterator(count_data + num_indices),
-        NO_ROCM(at_cuda_detail)ROCM_HIPCUB(::cub)::Max(),
+        ATEN_CUB_MAXIMUM(),
         num_indices
       );
     });
-#else
-    AT_DISPATCH_INDEX_TYPES(indices.scalar_type(), "embedding_bag_backward_cuda_sum_avg", [&] () {
-      embedding_dense_backward_cuda_scan<index_t>(sorted_indices, count);
-    });
-#endif
   }
   return embedding_backward_cuda_kernel(grad, orig_indices, sorted_indices,
       count, num_weights, padding_idx, mode == EmbeddingBagMode::MEAN, offset2bag,

@@ -54,6 +54,7 @@ from typing import Any, Callable, cast, Optional, TYPE_CHECKING, TypeVar, Union
 
 import torch.fx
 from torch import Tensor
+from torch._dynamo.callback import CallbackTrigger
 from torch._dynamo.mutation_guard import GenerationTracker
 from torch._dynamo.utils import counters, dynamo_timed, preserve_rng_state
 from torch._inductor.compile_fx import (
@@ -89,6 +90,7 @@ if TYPE_CHECKING:
 
     from torch._guards import CompileId
     from torch._inductor.utils import InputType
+    from torch.cuda import _POOL_HANDLE
     from torch.types import _bool
 
 StorageWeakRefPointer = int
@@ -100,7 +102,7 @@ S = TypeVar("S", bound="StorageWeakRefWrapper")
 if torch.backends.cuda.is_built():
     from torch._C import (
         _cuda_CUDAAllocator_AllocatorState as AllocatorState,
-        _set_cached_tensors_enabled as _set_cached_tensors_enabled,
+        _set_cached_tensors_enabled,
     )
 else:
 
@@ -227,7 +229,7 @@ class TreeManagerContainer:
                 self.graph = None
 
                 # manager was used again after existing cleanup,
-                # we shouldnt set it to None
+                # we shouldn't set it to None
                 if self.live_cudagraphify_fns == 0:
                     self.tree_manager = None
 
@@ -345,6 +347,17 @@ def get_manager(
     return get_container(device_index).tree_manager
 
 
+def is_cudagraph_capture_sizes(int_key: Union[int, tuple[int, ...]]) -> bool:
+    """
+    Returns true if all dynamic shapes should be captured or the dynamic shape
+    int_key should be captured.
+    """
+    return (
+        config.triton.cudagraph_capture_sizes is None
+        or int_key in config.triton.cudagraph_capture_sizes
+    )
+
+
 def cudagraphify_impl(
     model: ModelType,
     inputs: list[InputType],
@@ -366,6 +379,10 @@ def cudagraphify_impl(
         nonlocal has_warn
 
         int_key = get_ints(inputs)
+
+        if not is_cudagraph_capture_sizes(int_key):
+            return model(inputs)
+
         fn = fn_cache.get(int_key)
         if fn is not None:
             return fn(inputs)
@@ -385,7 +402,12 @@ def cudagraphify_impl(
         copy_misaligned_inputs(inputs, check_input_idxs)
 
         fn, out = cudagraphify(model, inputs, new_static_input_idxs, *args, **kwargs)
-        fn = align_inputs_from_check_idxs(fn, inputs_to_check=check_input_idxs)
+        # cudagraph will already clones input locally, no need to copy back
+        mutated_input_idxs: OrderedSet[int] = OrderedSet()
+        fn = align_inputs_from_check_idxs(
+            fn, inputs_to_check=check_input_idxs, mutated_input_idxs=mutated_input_idxs
+        )
+        # pyrefly: ignore [unsupported-operation]
         fn_cache[int_key] = fn
 
         return out
@@ -797,7 +819,7 @@ class CUDAGraphNode:
         id: GraphID,
         parent: Optional[CUDAGraphNode],
         inputs: list[InputType],
-        cuda_graphs_pool: tuple[int, int],
+        cuda_graphs_pool: _POOL_HANDLE,
         device_index: int,
         stack_traces: Optional[StackTraces],
         stream: torch.cuda.Stream,
@@ -901,6 +923,7 @@ class CUDAGraphNode:
             return None
 
         self.static_input_data_ptrs: InputList[Optional[int]] = [
+            # pyrefly: ignore [bad-argument-type]
             maybe_get_static_data_ptr(i, inputs, self.static_input_idxs)
             for i in range(len(inputs))
         ]
@@ -947,8 +970,10 @@ class CUDAGraphNode:
             self.expected_dead_indices_before_graph = different_indices
 
         rng_states = [inp for inp in inputs if isinstance(inp, torch.Generator)]
+        # pyrefly: ignore [bad-argument-type]
         recording_inputs = self._allocate_and_copy_recording_inputs(inputs)
         # recording inputs will copy over memory, so we can free non recording inputs
+        # pyrefly: ignore [missing-attribute]
         inputs.clear()
         del inputs
 
@@ -1208,6 +1233,7 @@ class CUDAGraphNode:
 
     def _record(self, model: ModelType, inputs: list[InputType]) -> OutputType:
         "Record the model"
+        assert self.graph is not None
 
         def static_input_iter() -> Generator[torch.Tensor, None, None]:
             for i in self.wrapped_function.static_input_idxs:
@@ -1226,7 +1252,7 @@ class CUDAGraphNode:
         }
 
         if config.triton.slow_path_cudagraph_asserts:
-            # need to use parent live weakrefs because live_indices isnt set yet
+            # need to use parent live weakrefs because live_indices isn't set yet
             memory = (
                 [] if self.parent is None else list(self.parent.path_live_weakrefs())
             )
@@ -1259,8 +1285,10 @@ class CUDAGraphNode:
         if not isinstance(static_outputs, (list, tuple)):
             static_outputs = (static_outputs,)
 
+        # pyrefly: ignore [bad-argument-type]
         self._add_first_outputs(static_outputs, static_input_persistent_storage_ptrs)
 
+        # pyrefly: ignore [bad-return]
         return static_outputs
 
     def _add_first_outputs(
@@ -1290,13 +1318,11 @@ class CUDAGraphNode:
                 self.output_storage_alias.append(UnaliasedStorage)
                 continue
 
-            (
-                torch._check(
-                    o.is_cuda or o.untyped_storage().data_ptr() == 0,
-                    lambda: (
-                        "Expected all cuda outputs in cuda graph recording. Non cuda output "
-                        f"from {self.stack_traces[i] if self.stack_traces else '(unknown)'}"
-                    ),
+            torch._check(
+                o.is_cuda or o.untyped_storage().data_ptr() == 0,
+                lambda: (
+                    "Expected all cuda outputs in cuda graph recording. Non cuda output "
+                    f"from {self.stack_traces[i] if self.stack_traces else '(unknown)'}"
                 ),
             )
 
@@ -1602,7 +1628,7 @@ class CUDAGraphNode:
 
     def clear_path_state(self) -> None:
         "Clear the path state in this current executing node"
-        # this doesnt actually do anything right now, leaving it as placeholder
+        # this doesn't actually do anything right now, leaving it as placeholder
 
     @staticmethod
     def _tensor_metadata(
@@ -1656,6 +1682,7 @@ class CUDAGraphNode:
             for i, inp in enumerate(inputs):
                 if not isinstance(inp, torch.Tensor):
                     assert isinstance(inp, (int, torch.Generator))
+                    # pyrefly: ignore [bad-argument-type]
                     recording_inputs.append(inp)
                 elif i not in self.static_input_idxs:
                     # static_input does an allocation!
@@ -1820,6 +1847,7 @@ def check_memory_pool(
         formatted = []
         for dp, block in allocated_not_in_live_storages.items():
             trace = format_tb(block.get("frames", []))
+            # pyrefly: ignore [bad-argument-type]
             formatted.append(f"Data Pointer: {dp}, history: \n{trace}")
         formatted_s = "\n".join(formatted)
         msg = (
@@ -2186,34 +2214,37 @@ class CUDAGraphTreeManager:
         self, new_inputs: list[InputType], function_id: FunctionID
     ) -> OutputType:
         assert not isinstance(self.current_node, CUDAWarmupNode)
-        graph_id = self.new_graph_id()
-        log.debug(
-            "Recording function %d of graph recording id %d",
-            function_id.id,
-            graph_id.id,
-        )
-        torch.cuda.synchronize()
-        node = CUDAGraphNode(
-            self.ids_to_funcs[function_id],
-            graph_id,
-            self.current_node,
-            new_inputs,
-            self.cuda_graphs_thread_pool,
-            self.device_index,
-            self.ids_to_stack_traces[function_id],
-            self.stream,
-            self.mode,
-            self.compile_id,
-        )
-        if self.current_node is None:
-            self.roots[function_id].append(node)
-        else:
-            self.current_node.add_child(function_id, node)
-        self.current_node = node
-        self.path_state = ExecutionState.RECORDING
-        self.update_generation()
-        torch.cuda.synchronize()
-        return node.run_first_inputs(new_inputs)
+        with torch._dynamo.callback_handler.install_callbacks(
+            CallbackTrigger.CUDAGRAPH_RECORDING, str(self.compile_id)
+        ):
+            graph_id = self.new_graph_id()
+            log.debug(
+                "Recording function %d of graph recording id %d",
+                function_id.id,
+                graph_id.id,
+            )
+            torch.cuda.synchronize()
+            node = CUDAGraphNode(
+                self.ids_to_funcs[function_id],
+                graph_id,
+                self.current_node,
+                new_inputs,
+                self.cuda_graphs_thread_pool,
+                self.device_index,
+                self.ids_to_stack_traces[function_id],
+                self.stream,
+                self.mode,
+                self.compile_id,
+            )
+            if self.current_node is None:
+                self.roots[function_id].append(node)
+            else:
+                self.current_node.add_child(function_id, node)
+            self.current_node = node
+            self.path_state = ExecutionState.RECORDING
+            self.update_generation()
+            torch.cuda.synchronize()
+            return node.run_first_inputs(new_inputs)
 
     def execute_node(
         self, node: CUDAGraphNode, new_inputs: list[InputType]
@@ -2524,7 +2555,11 @@ class CUDAGraphTreeManager:
         live_storages_weak_refs: list[int] = [t() for t in live_storages_wrappers]  # type: ignore[misc]
         ptrs_to_deallocate = self.current_node.data_ptrs_dead_since_invocation()
         torch._C._cuda_setCheckpointPoolState(
-            device, state, stale_storages, live_storages_weak_refs
+            device,
+            # pyrefly: ignore [bad-argument-type]
+            state,
+            stale_storages,
+            live_storages_weak_refs,
         )
 
         # NB: deduplicate aliased outputs

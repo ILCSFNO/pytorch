@@ -307,7 +307,15 @@ PyObject* THPAutograd_initExtension(PyObject* _unused, PyObject* unused) {
                 e.activityType() ==
                 (uint8_t)libkineto::ActivityType::GPU_USER_ANNOTATION;
           })
-      .def("nbytes", [](const KinetoEvent& e) { return e.nBytes(); });
+      .def("nbytes", [](const KinetoEvent& e) { return e.nBytes(); })
+      // whether the event is hidden
+      .def(
+          "is_hidden_event",
+          [](const KinetoEvent& e) { return e.isHiddenEvent(); })
+      // KinetoEvent metadata
+      .def("metadata_json", [](const KinetoEvent& e) {
+        return e.metadataJson();
+      });
 
   m.def("_soft_assert_raises", &setSoftAssertRaises);
   m.def("_get_sequence_nr", &at::sequence_number::peek);
@@ -455,7 +463,11 @@ PyObject* THPAutograd_initExtension(PyObject* _unused, PyObject* unused) {
       "_saved_tensors_hooks_is_enabled",
       at::SavedTensorDefaultHooks::is_enabled);
   m.def("_saved_tensors_hooks_enable", at::SavedTensorDefaultHooks::enable);
-  m.def("_saved_tensors_hooks_disable", at::SavedTensorDefaultHooks::disable);
+  m.def(
+      "_saved_tensors_hooks_disable",
+      at::SavedTensorDefaultHooks::disable,
+      py::arg("error_message"),
+      py::arg("fail_if_non_empty") = true);
   m.def(
       "_saved_tensors_hooks_set_tracing",
       at::SavedTensorDefaultHooks::set_tracing);
@@ -471,6 +483,27 @@ PyObject* THPAutograd_initExtension(PyObject* _unused, PyObject* unused) {
   m.def("_pop_saved_tensors_default_hooks", []() {
     torch::autograd::PyDefaultSavedVariableHooks::pop_hooks();
   });
+  m.def(
+      "_top_saved_tensors_default_hooks",
+      [](bool ignore_is_tracing)
+          -> std::optional<std::pair<py::function, py::function>> {
+        auto out = at::SavedTensorDefaultHooks::get_hooks(ignore_is_tracing);
+
+        if (!out.has_value()) {
+          return std::nullopt;
+        }
+
+        auto [pack_hook, unpack_hook] = *out;
+        // gil for destructor of pack_hook, unpack_hook that decrements
+        // reference
+        py::gil_scoped_acquire gil;
+
+        return std::make_pair(
+            py::reinterpret_steal<py::function>(pack_hook.release()),
+            py::reinterpret_steal<py::function>(unpack_hook.release()));
+      }
+
+  );
 
   m.def("_get_creation_meta", [](const at::Tensor& t) {
     auto* meta = torch::autograd::impl::get_view_autograd_meta(t);
@@ -565,6 +598,33 @@ PyObject* THPAutograd_initExtension(PyObject* _unused, PyObject* unused) {
             s.register_hooks(
                 std::make_unique<torch::autograd::PySavedVariableHooks>(
                     pack_hook, unpack_hook));
+          })
+      .def_property_readonly(
+          "data",
+          [](const torch::autograd::SavedVariable& s) -> py::object {
+            if (s.has_hooks()) {
+              auto opt = s.retrieve_unpack_hook_data();
+              TORCH_INTERNAL_ASSERT(opt.has_value());
+              py::gil_scoped_acquire gil;
+              const auto& [_unpack_fn, data_obj] = *opt;
+              PyObject* raw = data_obj.ptr(getPyInterpreter());
+              TORCH_INTERNAL_ASSERT(raw != nullptr);
+              return py::reinterpret_borrow<py::object>(raw);
+            } else {
+              return py::cast(s.get_raw_data().value());
+            }
+          })
+      .def_property_readonly(
+          "unpack_hook",
+          [](const torch::autograd::SavedVariable& s) -> py::object {
+            auto opt = s.retrieve_unpack_hook_data();
+            if (!opt.has_value()) {
+              return py::none();
+            }
+            py::gil_scoped_acquire gil;
+            const auto& [unpack_safe, _unused_data] = *opt;
+            auto* unpack_ptr = unpack_safe.ptr(getPyInterpreter());
+            return py::reinterpret_borrow<py::function>(unpack_ptr);
           });
 
   torch::autograd::profiler::python_tracer::init();
@@ -580,7 +640,7 @@ static PyObject* set_autocast_enabled(
   HANDLE_TH_ERRORS
   static PythonArgParser parser(
       {"set_autocast_enabled(std::string_view device_type, bool enabled)",
-       "set_autocast_enabled(bool enabled)"}); // this signature is depracated.
+       "set_autocast_enabled(bool enabled)"}); // this signature is deprecated.
   ParsedArgs<2> parsed_args;
   auto r = parser.parse(args, kwargs, parsed_args);
   // Set at::kCUDA as default value to prevent BC-breaking changes.
@@ -603,7 +663,7 @@ static PyObject* is_autocast_enabled(
   HANDLE_TH_ERRORS
   static PythonArgParser parser(
       {"is_autocast_enabled(std::string_view device_type)",
-       "is_autocast_enabled()"}); // this signature is depracated.
+       "is_autocast_enabled()"}); // this signature is deprecated.
   ParsedArgs<1> parsed_args;
   auto r = parser.parse(args, kwargs, parsed_args);
   // Set at::kCUDA as default value to prevent BC-breaking changes.
@@ -1053,7 +1113,7 @@ static PyObject* any_output_is_alias_to_input_or_output(
     if (!t.storage()) {
       return false;
     }
-    auto* cp = t.storage().data_ptr().get_context();
+    auto* cp = t.storage().unsafeGetStorageImpl();
     if (cp) {
       s.insert(cp);
     }
@@ -1064,7 +1124,7 @@ static PyObject* any_output_is_alias_to_input_or_output(
     if (!t.storage()) {
       return false;
     }
-    auto* cp = t.storage().data_ptr().get_context();
+    auto* cp = t.storage().unsafeGetStorageImpl();
     if (!cp) {
       return false;
     }

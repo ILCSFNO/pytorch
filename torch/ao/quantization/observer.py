@@ -245,7 +245,8 @@ class UniformQuantizationObserverBase(ObserverBase):
         if reduce_range:
             warnings.warn(
                 "Please use quant_min and quant_max to specify the range for observers. \
-                    reduce_range will be deprecated in a future release of PyTorch."
+                    reduce_range will be deprecated in a future release of PyTorch.",
+                stacklevel=2,
             )
         self.reduce_range = reduce_range
         self.register_buffer("eps", torch.tensor([eps], **factory_kwargs))
@@ -255,9 +256,11 @@ class UniformQuantizationObserverBase(ObserverBase):
             torch.per_channel_affine,
             torch.per_channel_symmetric,
             torch.per_channel_affine_float_qparams,
-        ), "Default Observer only works for per_tensor_affine, \
+        ), (
+            "Default Observer only works for per_tensor_affine, \
                 per_tensor_symmetric, per_channel_affine, \
                 per_channel_symmetric and per_channel_float_qparams quantization scheme"
+        )
 
         _ALLOWED_DTYPES = (
             torch.qint8,
@@ -273,14 +276,17 @@ class UniformQuantizationObserverBase(ObserverBase):
             torch.uint16,
         )
 
-        assert (
-            self.dtype in _ALLOWED_DTYPES
-        ), f"Default Observer only works for {_ALLOWED_DTYPES} data type"
+        assert self.dtype in _ALLOWED_DTYPES, (
+            f"Default Observer only works for {_ALLOWED_DTYPES} data type"
+        )
         self.has_customized_qrange = (quant_min is not None) and (quant_max is not None)
         if self.has_customized_qrange:
+            # pyrefly: ignore [bad-argument-type]
             validate_qmin_qmax(quant_min, quant_max)
         self.quant_min, self.quant_max = calculate_qmin_qmax(
+            # pyrefly: ignore [bad-argument-type]
             quant_min,
+            # pyrefly: ignore [bad-argument-type]
             quant_max,
             self.has_customized_qrange,
             self.dtype,
@@ -331,12 +337,12 @@ class UniformQuantizationObserverBase(ObserverBase):
         """
         # The variable names are prefixed with "initial" because their values (qmin and qmax) might be adjusted
         # based on whether quantization range is reduced and the datatype (signed/unsigned) used by the observer.
-        assert (
-            quant_min <= 0 <= quant_max
-        ), "Used-specified quantization range must include 0."
-        assert (
-            quant_min < quant_max
-        ), "qmin must be strictly less than qmax for user-specified quantization range."
+        assert quant_min <= 0 <= quant_max, (
+            "Used-specified quantization range must include 0."
+        )
+        assert quant_min < quant_max, (
+            "qmin must be strictly less than qmax for user-specified quantization range."
+        )
 
     @torch.jit.export
     def _calculate_qparams(
@@ -356,7 +362,7 @@ class UniformQuantizationObserverBase(ObserverBase):
         # Functionally equivalent to 'determine_qparams' in utils.py. Observers must be torchscriptable however and qscheme
         # as far as I can tell is not allowed to passed as a parameter in torchscript functions. This makes refactoring observer
         # to use this utility a massive pain and very gross. For now Im opting just to duplicate as this code
-        # seems unlikey to change (last update over 1 year ago) and when torchscript is fully deprecated we can refactor.
+        # seems unlikely to change (last update over 1 year ago) and when torchscript is fully deprecated we can refactor.
         # TODO(jakeszwe, jerryzh168)
         if not check_min_max_valid(min_val, max_val):
             return torch.tensor([1.0], device=min_val.device.type), torch.tensor(
@@ -386,7 +392,7 @@ class UniformQuantizationObserverBase(ObserverBase):
                     )
                 else:
                     zero_point = zero_point.new_full(zero_point.size(), 128)
-            elif self.dtype in [torch.uint16]:
+            elif self.dtype == torch.uint16:
                 zero_point = zero_point.new_full(zero_point.size(), 2**15)
         elif self.qscheme == torch.per_channel_affine_float_qparams:
             scale = (max_val - min_val) / float(quant_max - quant_min)
@@ -562,7 +568,7 @@ class MinMaxObserver(UniformQuantizationObserverBase):
         return x_orig
 
     @torch.jit.export
-    def calculate_qparams(self):
+    def calculate_qparams(self):  # type: ignore[override]
         r"""Calculates the quantization parameters."""
         return self._calculate_qparams(self.min_val, self.max_val)
 
@@ -785,7 +791,7 @@ class PerChannelMinMaxObserver(UniformQuantizationObserverBase):
         return x_orig
 
     @torch.jit.export
-    def calculate_qparams(self):
+    def calculate_qparams(self):  # type: ignore[override]
         return self._calculate_qparams(self.min_val, self.max_val)
 
     def extra_repr(self):
@@ -801,7 +807,7 @@ class PerChannelMinMaxObserver(UniformQuantizationObserverBase):
         unexpected_keys: list[str],
         error_msgs: list[str],
     ):
-        version = local_metadata.get("version", None)
+        version = local_metadata.get("version")
         if version is not None and version < 3:
             local_state = ["min_vals", "max_vals"]
             expected_min_name = "min_vals"
@@ -824,7 +830,8 @@ class PerChannelMinMaxObserver(UniformQuantizationObserverBase):
                     self.max_val.resize_(val.shape)
                 else:
                     warnings.warn(
-                        f"Observer load_from_state_dict got unexpected name {name}"
+                        f"Observer load_from_state_dict got unexpected name {name}",
+                        stacklevel=2,
                     )
                 # For torchscript module we need to update the attributes here since we do not
                 # call the `_load_from_state_dict` function defined module.py
@@ -835,7 +842,8 @@ class PerChannelMinMaxObserver(UniformQuantizationObserverBase):
                         self.max_val.copy_(val)
                     else:
                         warnings.warn(
-                            f"Observer load_from_state_dict got unexpected name {name}"
+                            f"Observer load_from_state_dict got unexpected name {name}",
+                            stacklevel=2,
                         )
             elif strict:
                 missing_keys.append(key)
@@ -1205,7 +1213,7 @@ class HistogramObserver(UniformQuantizationObserverBase):
         boundaries_new_histogram = torch.linspace(
             update_min, update_max, self.bins + 1, device=update_min.device
         ).to(histogram.device)
-        # this maps the mid-poits of the histogram to the new histogram's space
+        # this maps the mid-points of the histogram to the new histogram's space
         bucket_assignments = (
             torch.bucketize(mid_points_histogram, boundaries_new_histogram, right=True)
             - 1
@@ -1239,7 +1247,7 @@ class HistogramObserver(UniformQuantizationObserverBase):
         # If the orig hist only has one value (i.e., the min and max are the same)
         # we can just add it into new histogram
         if orig_min == orig_max:
-            bin_value = torch.sum(update_hist)
+            bin_value = torch.sum(orig_hist)
             transformed_orig_hist = (
                 torch.histc(orig_min, bins=self.bins, min=update_min, max=update_max)  # type: ignore[arg-type]
                 * bin_value
@@ -1268,9 +1276,9 @@ class HistogramObserver(UniformQuantizationObserverBase):
         self.min_val.copy_(min_val)
         self.max_val.resize_(max_val.shape)
         self.max_val.copy_(max_val)
-        assert (
-            min_val.numel() == 1 and max_val.numel() == 1
-        ), "histogram min/max values must be scalar."
+        assert min_val.numel() == 1 and max_val.numel() == 1, (
+            "histogram min/max values must be scalar."
+        )
         new_histogram = torch.histc(x, self.bins, min=min_val, max=max_val)  # type: ignore[arg-type]
         self.histogram.detach_().resize_(new_histogram.shape)
         self.histogram.copy_(new_histogram)
@@ -1284,7 +1292,9 @@ class HistogramObserver(UniformQuantizationObserverBase):
         # want to make our quantization range infinite
         # and in practice those values will be clamped
         if x_min == -torch.inf or x_max == torch.inf:
-            warnings.warn("torch.inf detected in input tensor, ignoring input")
+            warnings.warn(
+                "torch.inf detected in input tensor, ignoring input", stacklevel=2
+            )
             x = x[x.abs() != torch.inf]
             if x.numel() == 0:
                 return x_orig
@@ -1305,7 +1315,10 @@ class HistogramObserver(UniformQuantizationObserverBase):
             # new_min and new_max should already have requires_grad set to False
             new_min, new_max = new_min.detach(), new_max.detach()
             update_histogram = torch.histc(
-                x, self.bins, min=new_min, max=new_max  # type: ignore[arg-type]
+                x,
+                self.bins,
+                min=new_min,  # type: ignore[arg-type]
+                max=new_max,  # type: ignore[arg-type]
             ).to(self.histogram.device)
             if new_min == current_min and new_max == current_max:
                 combined_histogram = self.histogram + update_histogram
@@ -1330,14 +1343,15 @@ class HistogramObserver(UniformQuantizationObserverBase):
         return x_orig
 
     @torch.jit.export
-    def calculate_qparams(self):
+    def calculate_qparams(self):  # type: ignore[override]
         is_uninitialized = self.min_val == float("inf") and self.max_val == float(
             "-inf"
         )
         if is_uninitialized:
             warnings.warn(
                 "must run observer before calling calculate_qparams.\
-                                    Returning default scale and zero point "
+                                    Returning default scale and zero point ",
+                stacklevel=2,
             )
             return torch.tensor([1.0], device=self.min_val.device.type), torch.tensor(
                 [0], device=self.min_val.device.type
@@ -1443,7 +1457,7 @@ class FixedQParamsObserver(ObserverBase):
         return X
 
     @torch.jit.export
-    def calculate_qparams(self):
+    def calculate_qparams(self):  # type: ignore[override]
         return self.scale, self.zero_point
 
 
@@ -1501,7 +1515,8 @@ class PlaceholderObserver(ObserverBase):
             warnings.warn(
                 "Please use `is_dynamic` instead of `compute_dtype`. \
                     `compute_dtype` will be deprecated in a future release \
-                    of PyTorch."
+                    of PyTorch.",
+                stacklevel=2,
             )
 
     def forward(self, x):
@@ -1512,7 +1527,7 @@ class PlaceholderObserver(ObserverBase):
         return f"dtype={self.dtype}, is_dynamic={self.is_dynamic}"
 
     @torch.jit.export
-    def calculate_qparams(self):
+    def calculate_qparams(self):  # type: ignore[override]
         raise Exception(  # noqa: TRY002
             "calculate_qparams should not be called for PlaceholderObserver"
         )
@@ -1539,7 +1554,7 @@ class RecordingObserver(ObserverBase):
         return x
 
     @torch.jit.export
-    def calculate_qparams(self):
+    def calculate_qparams(self):  # type: ignore[override]
         raise Exception(  # noqa: TRY002
             "calculate_qparams should not be called for RecordingObserver"
         )
@@ -1572,7 +1587,7 @@ class NoopObserver(ObserverBase):
         return x
 
     @torch.jit.export
-    def calculate_qparams(self):
+    def calculate_qparams(self):  # type: ignore[override]
         raise Exception(  # noqa: TRY002
             "calculate_qparams should not be called for NoopObserver"
         )
@@ -1599,7 +1614,7 @@ class ReuseInputObserver(ObserverBase):
         return x
 
     @torch.jit.export
-    def calculate_qparams(self):
+    def calculate_qparams(self):  # type: ignore[override]
         raise Exception(  # noqa: TRY002
             "calculate_qparams should not be called for ReuseInputObserver"
         )
@@ -1777,9 +1792,9 @@ def get_block_size(
         input_shape: The input tensor shape possibly more than 2 dimensions
         granularity: The granularity type of the quantization
     """
-    assert isinstance(
-        granularity, Granularity
-    ), "Please provide an instance of Granularity, not subclass of it"
+    assert isinstance(granularity, Granularity), (
+        "Please provide an instance of Granularity, not subclass of it"
+    )
     if isinstance(granularity, PerTensor):
         return input_shape
     elif isinstance(granularity, PerAxis):
@@ -1789,9 +1804,9 @@ def get_block_size(
     elif isinstance(granularity, PerRow):
         return (1,) * (len(input_shape) - 1) + (input_shape[-1],)
     elif isinstance(granularity, PerGroup):
-        assert (
-            len(input_shape) == 2
-        ), f"Expecting input shape dim to be 2 for per group quantization, gotinput shape: {input_shape}"
+        assert len(input_shape) == 2, (
+            f"Expecting input shape dim to be 2 for per group quantization, gotinput shape: {input_shape}"
+        )
         return (1, granularity.group_size)
     elif isinstance(granularity, PerToken):
         block_size = [1] * len(input_shape)
@@ -1861,16 +1876,16 @@ class AffineQuantizedObserverBase(ABC, torch.nn.Module):
         Converts the observer node in the graph into its quantized representation
 
         Args:
-            model: graph module to conver the observer node in
+            model: graph module to convert the observer node in
             observer_node: the observer node to convert
         """
         from torch.ao.quantization.fx.utils import create_getattr_from_value
 
         with model.graph.inserting_before(observer_node):
             assert self.block_size is not None, "Expecting block_size to be populated"
-            assert (
-                self.original_dtype is not None
-            ), "Expecting original_dtype to be populated"
+            assert self.original_dtype is not None, (
+                "Expecting original_dtype to be populated"
+            )
             if hasattr(self, "is_dynamic") and self.is_dynamic:
                 choose_qparams_affine = model.graph.call_function(
                     torch.ops.pt2e_quant.choose_qparams_affine,
@@ -1897,10 +1912,18 @@ class AffineQuantizedObserverBase(ABC, torch.nn.Module):
             else:
                 scale, zero_point = self.calculate_qparams()
                 scale_node = create_getattr_from_value(
-                    model, model.graph, "_scale", scale
+                    model,
+                    model.graph,
+                    "_scale",
+                    scale,
+                    scale.device if isinstance(scale, torch.Tensor) else None,
                 )
                 zero_point_node = create_getattr_from_value(
-                    model, model.graph, "_zero_point", zero_point
+                    model,
+                    model.graph,
+                    "_zero_point",
+                    zero_point,
+                    zero_point.device if isinstance(zero_point, torch.Tensor) else None,
                 )
 
             q_node = model.graph.call_function(

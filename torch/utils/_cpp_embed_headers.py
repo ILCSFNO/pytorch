@@ -39,7 +39,8 @@ def embed_headers(
     fname: str, include_dirs: Optional[Union[Sequence[str], Sequence[Path], str]] = None
 ) -> str:
     if include_dirs is None:
-        include_dirs = [Path(__file__).parent.parent.parent]
+        base_dir = Path(__file__).parent.parent.parent
+        include_dirs = [base_dir, base_dir / "aten" / "src"]
     elif isinstance(include_dirs, str):
         include_dirs = [Path(include_dirs)]
     else:
@@ -52,6 +53,6 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("Usage:\n {sys.argv[0]} filename")
+        print(f"Usage:\n {sys.argv[0]} filename")
         sys.exit(1)
     print(embed_headers(sys.argv[1]))
