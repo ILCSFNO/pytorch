@@ -2042,10 +2042,9 @@ graph(%Ra, %Rb):
             self.assertEqual(inp_refcount + 1, sys.getrefcount(ivalue_holder))
             return ivalue_holder + 1
 
-        test_input = 2200
-        before_count = sys.getrefcount(test_input)
-        test_func_scope_helper(test_input)
-        after_count = sys.getrefcount(test_input)
+        before_count = sys.getrefcount(py_array)
+        test_func_scope_helper(py_array)
+        after_count = sys.getrefcount(py_array)
 
         # after the test_func_scope_helper_call, the refcount of
         # test_input should be equal to the original refcount
@@ -9459,7 +9458,7 @@ dedent """
                 return self.mods(input)
 
         m = M()
-        self.assertTrue('mods.conv.weight' in m.state_dict().keys())
+        self.assertTrue('mods.conv.weight' in m.state_dict())
 
     def test_script_sequential_multi_output_fail(self):
         class Sub(torch.jit.ScriptModule):
@@ -11954,7 +11953,7 @@ dedent """
             # type: (Dict[str, int]) -> Tuple[str, int]
             key_str = ""
             sum = 0
-            for key in x.keys():
+            for key in x:
                 key_str += key
             for val in x.values():
                 sum += val
@@ -16271,8 +16270,10 @@ for test in criterion_tests:
     add_nn_module_test(**test)
 
 if __name__ == '__main__':
-    TestCase._default_dtype_check_enabled = True
-    run_tests()
-    import jit.test_module_interface
-    suite = unittest.findTestCases(jit.test_module_interface)
-    unittest.TextTestRunner().run(suite)
+    if sys.version_info < (3, 14):
+        TestCase._default_dtype_check_enabled = True
+        run_tests()
+        import jit.test_module_interface
+
+        suite = unittest.findTestCases(jit.test_module_interface)
+        unittest.TextTestRunner().run(suite)

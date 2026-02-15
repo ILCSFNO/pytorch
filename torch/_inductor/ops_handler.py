@@ -6,7 +6,16 @@ import itertools
 import re
 import warnings
 from io import StringIO
-from typing import Any, Callable, Generic, Literal, NamedTuple, Optional, TypeVar, Union
+from typing import (
+    Any,
+    Generic,
+    Literal,
+    NamedTuple,
+    Optional,
+    TYPE_CHECKING,
+    TypeVar,
+    Union,
+)
 from unittest.mock import patch
 
 import sympy
@@ -18,8 +27,22 @@ from ..utils._ordered_set import OrderedSet
 from .utils import IndentedBuffer, reduction_num_outputs, sympy_index_symbol, sympy_str
 
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+
 T = TypeVar("T")
-StoreMode = Optional[Literal["atomic_add", "tma"]]
+AtomicMode = Literal[
+    "atomic_add",
+    "atomic_max",
+    "atomic_min",
+    "atomic_and",
+    "atomic_or",
+    "atomic_xor",
+    "atomic_cas",
+    "atomic_xchg",
+]
+StoreMode = Optional[Union[AtomicMode, Literal["tma"]]]
 ReductionType = Literal[
     "argmax",
     "argmin",
@@ -293,6 +316,7 @@ class OpsHandler(Generic[T]):
         name: str,
         reduction_type: ReductionType,
         value: T,
+        extra_meta: dict[str, Any],
     ) -> None:
         raise NotImplementedError
 
@@ -382,6 +406,9 @@ class OpsHandler(Generic[T]):
         raise NotImplementedError
 
     def log2(self, x0: T) -> T:
+        raise NotImplementedError
+
+    def ldexp(self, x0: T, n: T) -> T:
         raise NotImplementedError
 
     def nextafter(self, x0: T, x1: T) -> T:
@@ -547,6 +574,10 @@ class OpsHandler(Generic[T]):
         raise NotImplementedError
 
     def fma(self, x: T, y: T, z: T) -> T:
+        raise NotImplementedError
+
+    def mul_rn(self, x: T, y: T) -> T:
+        """Multiplication with round-to-nearest, preventing fusion with subsequent ops."""
         raise NotImplementedError
 
     def igamma(self, x: T, y: T) -> T:

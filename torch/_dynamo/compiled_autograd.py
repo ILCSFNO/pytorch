@@ -147,7 +147,7 @@ class NaNChecker:
             # so Compiled Autograd will always lift the param and
             # this should always be true
             assert (
-                param_node.target == operator.getitem
+                param_node.target is operator.getitem
                 and param_node.args[0] is inputs_node  # type: ignore[possibly-undefined]
                 and isinstance(param_node.args[1], int)
             )
@@ -155,7 +155,7 @@ class NaNChecker:
 
         self.output_names = [node.name for node in output_nodes]
 
-    def prep_with_inputs(self, inputs: tuple[torch.Tensor]) -> None:
+    def prep_with_inputs(self, inputs: tuple[torch.Tensor, ...]) -> None:
         if not self.accumulate_grad:
             # Using .grad, nothing to prep
             return
@@ -171,7 +171,7 @@ class NaNChecker:
 
             self.params_to_check[f"inputs[{idx}]"] = inputs[idx]
 
-    def check(self, out: tuple[torch.Tensor]) -> None:
+    def check(self, out: tuple[torch.Tensor, ...]) -> None:
         if self.accumulate_grad:
             # Using .backward, graph outputs are empty
             assert not out
@@ -419,6 +419,7 @@ class AutogradCompilerInstance:
         self.stack.enter_context(
             torch.fx.experimental.symbolic_shapes._suppress_guards(env)
         )
+        # pyrefly: ignore [bad-return]
         return (
             str(CompileContext.current_compile_id()),
             inputs,
@@ -448,6 +449,7 @@ class AutogradCompilerInstance:
         pctx: Any,
         ctx: Any,
         maybe_backward_state_idx: Optional[int],
+        opaque_object_indices: list[int],
     ) -> Sequence[Any]:
         # The AOTBackward call consists of three things: the prologue, the
         # backward graph, and the epilogue.
@@ -461,6 +463,11 @@ class AutogradCompilerInstance:
         # into the CA graph and have Dynamo trace into it.
 
         psymints = [self.to_proxy(e) for e in ctx._get_compiled_autograd_symints()]
+
+        popaque_objects = [
+            self.hooks_proxy[idx]  # type: ignore[index]
+            for idx in opaque_object_indices
+        ]
 
         # NOTE: we should only close over constants
         CompiledFunction = ctx._forward_cls
@@ -481,11 +488,13 @@ class AutogradCompilerInstance:
         def call_aot_bwd_prologue(
             ctx_saved_tensors: Sequence[torch.Tensor],
             ctx_symints: Sequence[IntLikeType],
+            ctx_opaque_objs: Sequence[Any],
             *flat_args: Sequence[Any],
         ) -> Any:
             out = torch._functorch._aot_autograd.runtime_wrappers._backward_prologue_functional(
                 ctx_saved_tensors,
                 ctx_symints,
+                ctx_opaque_objs,
                 metadata,
                 maybe_subclass_metadata,
                 *flat_args,
@@ -498,6 +507,7 @@ class AutogradCompilerInstance:
             args=(
                 psaved_tensors,
                 psymints,
+                popaque_objects,
                 *pinputs,
             ),
             kwargs={},
@@ -537,6 +547,7 @@ class AutogradCompilerInstance:
             # run over all nodes of the aot_backward graph.
             # copy and paste them all into the compiled autograd graph.
             args_idx = 0
+            # pyrefly: ignore [implicit-any]
             value_remap = {}
             poutputs: Optional[list[torch.fx.Proxy]] = None
 
@@ -648,6 +659,7 @@ class AutogradCompilerInstance:
         backward_idx: int,
         ctx: torch.autograd.function.BackwardCFunction,
         maybe_backward_state_idx: Optional[int],
+        opaque_object_indices: list[int],
     ) -> tuple[Optional[torch.Tensor], ...]:
         assert self.hooks_proxy is not None
         pctx = self.hooks_proxy[backward_idx]  # type: ignore[index]
@@ -662,6 +674,7 @@ class AutogradCompilerInstance:
                 pctx,
                 ctx,
                 maybe_backward_state_idx,
+                opaque_object_indices,
             )
         else:
             proxies = self.fx_tracer.create_proxy(
@@ -755,7 +768,6 @@ class AutogradCompilerInstance:
         self, fn: Callable[..., Any], args: Any, output_metadata: Sequence[Any]
     ) -> Sequence[torch.Tensor]:
         """Proxies a call to fn(*args) into the graph"""
-        flat_args, _ = pytree.tree_flatten(args)
         proxy_args = pytree.tree_map(lambda e: self.to_proxy(e), args)
         proxy_out = self.fx_tracer.create_proxy(
             "call_function", fn, args=proxy_args, kwargs={}
@@ -996,8 +1008,8 @@ class AutogradCompilerInstance:
         sizes_node = next(it)
         assert sizes_node.name == "sizes"
 
-        for getitem_node in sizes_node.users.keys():
-            assert getitem_node.target == operator.getitem
+        for getitem_node in sizes_node.users:
+            assert getitem_node.target is operator.getitem
             if getitem_node.users:
                 used_sizes.append(getitem_node)
             else:
@@ -1159,7 +1171,7 @@ class AutogradCompilerInstance:
     def is_placeholder(node: torch.fx.Node) -> bool:
         if node.op == "placeholder" or (
             node.op == "call_function"
-            and node.target == operator.getitem
+            and node.target is operator.getitem
             and node.args[0].op == "placeholder"  # type: ignore[union-attr, arg-type]
         ):
             return True
@@ -1176,7 +1188,7 @@ class AutogradCompilerInstance:
         ):
             param_node, grad_node = node.args[0], node.args[1]
             getitem_node = None
-            if grad_node.target == operator.getitem:
+            if grad_node.target is operator.getitem:
                 getitem_node = grad_node
                 grad_node = getitem_node.args[0]
 
@@ -1279,7 +1291,7 @@ class AutogradCompilerInstance:
 
             # users are all getitem ops and they are used by same registered node
             assert all(
-                user.op == "call_function" and user.target == operator.getitem
+                user.op == "call_function" and user.target is operator.getitem
                 for user in users
             )
             registered_node = next(iter(users[0].users.keys()))
@@ -1349,6 +1361,7 @@ class AutogradCompilerInstance:
             if len(output_nodes) > 0:
                 continue
 
+            # pyrefly: ignore [implicit-any]
             input_nodes_and_users = []
             input_nodes_and_users.extend(list(input_nodes))
             for input_node in input_nodes:
@@ -1357,7 +1370,7 @@ class AutogradCompilerInstance:
                     for user in list(input_node.users.keys())
                     if not (
                         user.op == "call_function"
-                        and user.target == call_hook
+                        and user.target is call_hook
                         and node.kwargs.get("hook_type", None) == "post_hook"
                     )
                 )

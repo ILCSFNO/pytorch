@@ -7,7 +7,7 @@ import pickle
 import shutil
 from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager, nullcontext
-from typing import Any, Callable, Literal, Optional, TYPE_CHECKING
+from typing import Any, Literal, Optional, TYPE_CHECKING
 
 import torch.fx
 from torch._dynamo.aot_compile_types import BundledAOTAutogradSerializableCallable
@@ -23,7 +23,7 @@ from . import config
 
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from torch.compiler._cache import CacheInfo
     from torch.fx import GraphModule
@@ -121,6 +121,15 @@ class CacheCompiledArtifact(CompiledArtifact):
     def __call__(self, *args: Any) -> Any:
         return self._compiled_fn(*args)
 
+    def is_saveable(self) -> bool:
+        if self._artifacts is None:
+            return False
+        _, cache_info = self._artifacts
+        # 0 means nothing was saved
+        # >1 means multiple artifacts were saved, which is concerning
+        # (we only expect one)
+        return len(cache_info.aot_autograd_artifacts) == 1
+
     def save(
         self, *, path: str, format: Literal["binary", "unpacked"] = "binary"
     ) -> None:
@@ -130,7 +139,19 @@ class CacheCompiledArtifact(CompiledArtifact):
                     "CompiledArtifact.save failed to save since there's no artifact to save"
                 )
             artifact_bytes, cache_info = self._artifacts
-            assert len(cache_info.aot_autograd_artifacts) == 1, cache_info
+            if len(cache_info.aot_autograd_artifacts) == 0:
+                raise RuntimeError(
+                    f"CompiledArtifact.save failed to save due to no aot_autograd artifacts. "
+                    f"This likely means there was something that was not serializable in the "
+                    f"graph passed to standalone_compile. This can generally be fixed by "
+                    f"ensuring that your model only uses constructs that are serializable. "
+                    f"{cache_info}"
+                )
+            if len(cache_info.aot_autograd_artifacts) > 1:
+                raise AssertionError(
+                    f"CompiledArtifact.save failed to save because there was more than one "
+                    f"artifact but we only expected one. {cache_info}"
+                )
             key = cache_info.aot_autograd_artifacts[0]
 
             if format == "binary":

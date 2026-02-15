@@ -4,7 +4,7 @@ import math
 import operator
 import sys
 from collections.abc import Callable
-from typing import Optional, SupportsFloat, TYPE_CHECKING, TypeVar, Union
+from typing import SupportsFloat, TYPE_CHECKING, TypeVar
 from typing_extensions import TypeVarTuple, Unpack
 
 import sympy
@@ -22,7 +22,7 @@ from sympy.utilities.iterables import sift
 
 from torch.torch_version import TorchVersion
 
-from .numbers import int_oo
+from .numbers import int_oo, is_infinite
 
 
 if TYPE_CHECKING:
@@ -92,7 +92,8 @@ __all__ = [
 def _is_symbols_binary_summation(expr: sympy.Expr) -> bool:
     # No need to check that two args are not the same, since expr is pr-optimized but we do it anyway.
     return (
-        expr.is_Add
+        isinstance(expr, sympy.Expr)
+        and expr.is_Add
         and len(expr._args) == 2
         and expr._args[0].is_symbol
         and expr._args[1].is_symbol
@@ -102,11 +103,10 @@ def _is_symbols_binary_summation(expr: sympy.Expr) -> bool:
 
 def _keep_float(
     f: Callable[[Unpack[_Ts]], _T],
-) -> Callable[[Unpack[_Ts]], Union[_T, sympy.Float]]:
+) -> Callable[[Unpack[_Ts]], _T | sympy.Float]:
     @functools.wraps(f)
-    def inner(*args: Unpack[_Ts]) -> Union[_T, sympy.Float]:
-        # pyrefly: ignore [bad-argument-type]
-        r: Union[_T, sympy.Float] = f(*args)
+    def inner(*args: Unpack[_Ts]) -> _T | sympy.Float:
+        r: _T | sympy.Float = f(*args)
         if any(isinstance(a, sympy.Float) for a in args) and not isinstance(
             r, sympy.Float
         ):
@@ -117,7 +117,7 @@ def _keep_float(
     return inner
 
 
-def fuzzy_eq(x: Optional[bool], y: Optional[bool]) -> Optional[bool]:
+def fuzzy_eq(x: bool | None, y: bool | None) -> bool | None:
     if None in (x, y):
         return None
     return x == y
@@ -216,9 +216,7 @@ class FloorDiv(sympy.Function):
     # Automatic evaluation.
     # https://docs.sympy.org/latest/guides/custom-functions.html#best-practices-for-eval
     @classmethod
-    def eval(
-        cls, base: sympy.Integer, divisor: sympy.Integer
-    ) -> Union[sympy.Basic, None]:
+    def eval(cls, base: sympy.Integer, divisor: sympy.Integer) -> sympy.Basic | None:
         # python test/test_dynamic_shapes.py -k TestDimConstraints.test_dim_constraints_solve_full
         # Assert triggered by inequality solver
         # assert base.is_integer, base
@@ -228,12 +226,7 @@ class FloorDiv(sympy.Function):
         # makes it difficult to check the types.
         if divisor.is_zero:
             raise ZeroDivisionError("division by zero")
-        if base in (int_oo, -int_oo, sympy.oo, -sympy.oo) and divisor in (
-            int_oo,
-            -int_oo,
-            sympy.oo,
-            -sympy.oo,
-        ):
+        if is_infinite(base) and is_infinite(divisor):
             return sympy.nan
         if base is sympy.nan or divisor is sympy.nan:
             return sympy.nan
@@ -244,13 +237,13 @@ class FloorDiv(sympy.Function):
             return base
         if base.is_integer and equal_valued(divisor, -1):
             return sympy.Mul(base, -1)
+        if base == divisor:
+            return sympy.S.One
+
         if (
             isinstance(base, sympy.Number)
             and isinstance(divisor, sympy.Number)
-            and (
-                base in (int_oo, -int_oo, sympy.oo, -sympy.oo)
-                or divisor in (int_oo, -int_oo, sympy.oo, -sympy.oo)
-            )
+            and (is_infinite(base) or is_infinite(divisor))
         ):
             r = float(base) / float(divisor)
             if r == math.inf:
@@ -311,6 +304,13 @@ class FloorDiv(sympy.Function):
 
         return None
 
+    def _eval_is_nonnegative(self) -> bool | None:
+        # pyrefly: ignore [missing-attribute]
+        p, q = self.args[:2]
+        if all([p.is_integer, q.is_integer, p.is_nonnegative, q.is_nonnegative]):
+            return True
+        return None
+
 
 class ModularIndexing(sympy.Function):
     """
@@ -324,7 +324,7 @@ class ModularIndexing(sympy.Function):
     @classmethod
     def eval(
         cls, base: sympy.Integer, divisor: sympy.Integer, modulus: sympy.Integer
-    ) -> Optional[sympy.Basic]:
+    ) -> sympy.Basic | None:
         if base == 0 or modulus == 1:
             return sympy.S.Zero
         if (
@@ -373,7 +373,7 @@ class ModularIndexing(sympy.Function):
 
         return None
 
-    def _eval_is_nonnegative(self) -> Optional[bool]:
+    def _eval_is_nonnegative(self) -> bool | None:
         # pyrefly: ignore [missing-attribute]
         p, q = self.args[:2]
         return fuzzy_eq(p.is_nonnegative, q.is_nonnegative)  # type: ignore[attr-defined]
@@ -387,23 +387,21 @@ class Where(sympy.Function):
     nargs: tuple[int, ...] = (3,)
     precedence: int = 35  # lower precedence than add
 
-    def _eval_is_integer(self) -> Optional[bool]:
+    def _eval_is_integer(self) -> bool | None:
         return True if self.args[1].is_integer and self.args[2].is_integer else None  # type: ignore[attr-defined]
 
-    def _eval_is_nonnegative(self) -> Optional[bool]:
+    def _eval_is_nonnegative(self) -> bool | None:
         return (
             True
             if self.args[1].is_nonnegative and self.args[2].is_nonnegative  # type: ignore[attr-defined]
             else None
         )
 
-    def _eval_is_positive(self) -> Optional[bool]:
+    def _eval_is_positive(self) -> bool | None:
         return True if self.args[1].is_positive and self.args[2].is_positive else None  # type: ignore[attr-defined]
 
     @classmethod
-    def eval(
-        cls, c: sympy.Basic, p: sympy.Basic, q: sympy.Basic
-    ) -> Optional[sympy.Basic]:
+    def eval(cls, c: sympy.Basic, p: sympy.Basic, q: sympy.Basic) -> sympy.Basic | None:
         if c == sympy.true:
             return p
         elif c == sympy.false:
@@ -419,7 +417,7 @@ class PythonMod(sympy.Function):
     is_integer: bool = True
 
     @classmethod
-    def eval(cls, p: sympy.Expr, q: sympy.Expr) -> Optional[sympy.Expr]:
+    def eval(cls, p: sympy.Expr, q: sympy.Expr) -> sympy.Expr | None:
         # python test/dynamo/test_export.py -k ExportTests.test_trivial_constraint
         # Triggered by sympy.solvers.inequalities.reduce_inequalities
         # assert p.is_integer, p
@@ -465,13 +463,13 @@ class PythonMod(sympy.Function):
         return None
 
     # NB: args[1] for PythonMod
-    def _eval_is_nonnegative(self) -> Optional[bool]:
+    def _eval_is_nonnegative(self) -> bool | None:
         return True if self.args[1].is_positive else None  # type: ignore[attr-defined]
 
-    def _eval_is_nonpositive(self) -> Optional[bool]:
+    def _eval_is_nonpositive(self) -> bool | None:
         return True if self.args[1].is_negative else None  # type: ignore[attr-defined]
 
-    def _ccode(self, printer):
+    def _ccode(self, printer) -> str:
         # pyrefly: ignore [missing-attribute]
         p = printer.parenthesize(self.args[0], PRECEDENCE["Atom"] - 0.5)
         # pyrefly: ignore [missing-attribute]
@@ -558,7 +556,7 @@ class CeilToInt(sympy.Function):
         if isinstance(number, sympy.Number):
             return sympy.Integer(math.ceil(float(number)))
 
-    def _ccode(self, printer):
+    def _ccode(self, printer) -> str:
         # pyrefly: ignore [missing-attribute]
         number = printer.parenthesize(self.args[0], self.args[0].precedence - 0.5)
         return f"ceil({number})"
@@ -664,7 +662,7 @@ class MinMaxBase(Expr, LatticeOp):  # type: ignore[misc]
     @classmethod
     def _satisfy_unique_summations_symbols(
         cls, args
-    ) -> Optional[set[sympy.core.symbol.Symbol]]:
+    ) -> set[sympy.core.symbol.Symbol] | None:
         """
         One common case in some models is building expressions of the form
         max(max(max(a+b...), c+d), e+f) which is simplified to max(a+b, c+d, e+f, ...).
@@ -719,8 +717,8 @@ class MinMaxBase(Expr, LatticeOp):  # type: ignore[misc]
 
     @classmethod
     def _unique_symbols(
-        cls, args, initial_set: Optional[set[sympy.core.symbol.Symbol]] = None
-    ) -> Optional[set[sympy.core.symbol.Symbol]]:
+        cls, args, initial_set: set[sympy.core.symbol.Symbol] | None = None
+    ) -> set[sympy.core.symbol.Symbol] | None:
         """
         Return seen_symbols if all atoms in all args are all unique symbols,
         else returns None. initial_set can be used to represent initial value for seen_symbols
@@ -1153,10 +1151,7 @@ class IntTrueDiv(sympy.Function):
         if (
             isinstance(base, sympy.Number)
             and isinstance(divisor, sympy.Number)
-            and (
-                base in (int_oo, -int_oo, sympy.oo, -sympy.oo)
-                or divisor in (int_oo, -int_oo, sympy.oo, -sympy.oo)
-            )
+            and (is_infinite(base) or is_infinite(divisor))
         ):
             # Don't have to worry about precision here, you're getting zero or
             # inf from the division
@@ -1164,7 +1159,7 @@ class IntTrueDiv(sympy.Function):
         if isinstance(base, sympy.Integer) and isinstance(divisor, sympy.Integer):
             return sympy.Float(int(base) / int(divisor))
 
-    def _ccode(self, printer):
+    def _ccode(self, printer) -> str:
         # pyrefly: ignore [missing-attribute]
         base = printer.parenthesize(self.args[0], PRECEDENCE["Atom"] - 0.5)
         # pyrefly: ignore [missing-attribute]
@@ -1244,6 +1239,8 @@ class TruncToFloat(sympy.Function):
 
     @classmethod
     def eval(cls, number):
+        if number in (sympy.oo, -sympy.oo):
+            return number
         # assert number.is_integer is not True, number
         if isinstance(number, sympy.Number):
             # NB: It is safe to use truncation to integer, which is what
@@ -1331,11 +1328,11 @@ class Identity(sympy.Function):
 
     precedence = 10
 
-    def __repr__(self):  # type: ignore[override]
+    def __repr__(self) -> str:  # type: ignore[override]
         # pyrefly: ignore [missing-attribute]
         return f"Identity({self.args[0]})"
 
-    def _sympystr(self, printer):
+    def _sympystr(self, printer) -> str:
         """Controls how sympy's StrPrinter prints this"""
         # pyrefly: ignore [missing-attribute]
         return f"({printer.doprint(self.args[0])})"
@@ -1346,6 +1343,19 @@ class Identity(sympy.Function):
 
     def _eval_is_integer(self):
         return self.args[0].is_integer  # type: ignore[attr-defined]
+
+    @property
+    def is_number(self):
+        # Treat Identity as numeric only when the argument is comparable.
+        # This avoids creating numeric non-comparable Identity(I) terms.
+        # pyrefly: ignore [missing-attribute]
+        return bool(self.args[0].is_number and self.args[0].is_comparable)
+
+    @property
+    def is_comparable(self):
+        # Delegate comparability to the wrapped argument.
+        # pyrefly: ignore [missing-attribute]
+        return bool(self.args[0].is_comparable)
 
     def _eval_expand_identity(self, **hints):
         # Removes the identity op.
@@ -1427,6 +1437,8 @@ OpaqueUnaryFn_log2 = make_opaque_unary_fn("log2")
 def make_opaque_bitwise_fn(name, real_op_name):
     if name == "bitwise_and":
         prec = PRECEDENCE["BitwiseAnd"]
+    elif name == "bitwise_xor":
+        prec = PRECEDENCE["BitwiseXor"]
     elif name == "bitwise_or":
         prec = PRECEDENCE["BitwiseOr"]
     else:
@@ -1462,3 +1474,4 @@ def make_opaque_bitwise_fn(name, real_op_name):
 
 BitwiseFn_bitwise_and = make_opaque_bitwise_fn("bitwise_and", "and_")
 BitwiseFn_bitwise_or = make_opaque_bitwise_fn("bitwise_or", "or_")
+BitwiseFn_bitwise_xor = make_opaque_bitwise_fn("bitwise_xor", "xor")

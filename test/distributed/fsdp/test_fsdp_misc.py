@@ -35,7 +35,7 @@ from torch.testing._internal.common_fsdp import (
     _assert_module_states,
     DEVICEInitMode,
     FSDPInitMode,
-    FSDPTest,
+    FSDPTestContinuous,
     FSDPTestMultiThread,
     MLP,
     NestedWrappedModule,
@@ -75,7 +75,7 @@ class MyModel(nn.Module):
         return self.b(self.a(x + y))
 
 
-class TestFSDPMiscMultiProcess(FSDPTest):
+class TestFSDPMiscMultiProcess(FSDPTestContinuous):
     @property
     def world_size(self):
         return 2
@@ -479,6 +479,7 @@ class TestFSDPMiscMultiProcess(FSDPTest):
                     for (n, p), (n_prev, p_prev) in zip(
                         fsdp_overlap.named_parameters(), fsdp_overlap_prev_params
                     ):
+                        self.assertEqual(n, n_prev)
                         self.assertNotEqual(
                             p,
                             p_prev,

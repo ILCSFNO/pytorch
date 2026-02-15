@@ -450,8 +450,7 @@ class ComposabilityTest(MultiProcContinuousTest):
             total_fsdp_params = 0
 
             for state in distributed_state._state_ctx.all_states:
-                if state._fsdp_param_group:
-                    group = state._fsdp_param_group
+                for group in state._fsdp_param_groups:
                     for fsdp_param in group.fsdp_params:
                         total_fsdp_params += 1
                         if fsdp_param.sharded_state == ShardedState.UNSHARDED:
@@ -499,6 +498,7 @@ class ComposabilityTest(MultiProcContinuousTest):
             [
                 _ComputationType.UNSHARD,
                 _ComputationType.FORWARD,
+                _ComputationType.REDUCE_GRAD,  # Contains final fsdp post_backward
             ],
             microbatch_index=0,
         )

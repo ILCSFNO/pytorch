@@ -97,6 +97,7 @@ class TestCase(TorchTestCase):
             print(k, v.most_common())
         reset()
         utils.counters.clear()
+        torch._C._autograd._saved_tensors_hooks_enable()
         super().tearDown()
         if self._prior_is_grad_enabled is not torch.is_grad_enabled():
             log.warning("Running test changed grad mode")
@@ -115,6 +116,8 @@ class TestCase(TorchTestCase):
     # graph break tests
 
 
+# NB: multiple inheritance with LoggingTestCase is possible - this should be fine
+# since there is no overlap in overridden methods.
 class TestCaseWithNestedGraphBreaks(TestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -166,6 +169,7 @@ class CPythonTestCase(TestCase):
     assertListEqual = unittest.TestCase.assertListEqual
     assertTupleEqual = unittest.TestCase.assertTupleEqual
     assertSetEqual = unittest.TestCase.assertSetEqual
+    # pyrefly: ignore [bad-override]
     assertDictEqual = polyfills.assert_dict_equal
     # pyrefly: ignore [bad-override]
     assertRaises = unittest.TestCase.assertRaises
@@ -218,7 +222,7 @@ class CPythonTestCase(TestCase):
         if m:
             test_py_ver = tuple(map(int, m.group().removeprefix(prefix).split("_")))
             py_ver = sys.version_info[:2]
-            if py_ver < test_py_ver:
+            if py_ver != test_py_ver:
                 expected = ".".join(map(str, test_py_ver))
                 got = ".".join(map(str, py_ver))
                 raise unittest.SkipTest(
@@ -236,3 +240,7 @@ class CPythonTestCase(TestCase):
                 enable_trace_unittest=True,
             ),
         )
+
+    # pyrefly: ignore [implicit-any]
+    def wrap_with_policy(self, method_name: str, policy: Callable) -> None:
+        pass

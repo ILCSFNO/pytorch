@@ -2,7 +2,8 @@
 # mypy: allow-untyped-defs
 import math as pymath
 import warnings
-from typing import Any, Callable, TypeVar
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 from .triton_compat import (  # noqa: F401
     _log2,
@@ -492,7 +493,7 @@ def exclusive_scan_decoupled_lookback_64(scratch_base, block_value, index, combi
             prefix_valid = True
 
         if flag == 2:
-            test_target = -1
+            test_target = tl.full([], -1, index.dtype)  # Match the original type
         else:
             test_target = test_target - 1
 

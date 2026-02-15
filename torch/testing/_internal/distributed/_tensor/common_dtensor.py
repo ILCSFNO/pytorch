@@ -3,6 +3,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 
 import contextlib
+import copy
 import functools
 import itertools
 import sys
@@ -16,6 +17,10 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed._functional_collectives import (
+    all_gather_tensor_autograd,
+    reduce_scatter_tensor_autograd,
+)
 from torch.distributed._local_tensor import (
     LocalIntNode,
     LocalTensor,
@@ -25,21 +30,27 @@ from torch.distributed._local_tensor import (
 )
 from torch.distributed.tensor import (
     DeviceMesh,
+    distribute_module,
     distribute_tensor,
     DTensor,
     init_device_mesh,
+    Partial,
     Placement,
     Replicate,
     Shard,
 )
+from torch.distributed.tensor._dtensor_spec import ShardOrderEntry
+from torch.distributed.tensor._redistribute import redistribute_local_tensor
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     parallelize_module,
+    ParallelStyle,
     PrepareModuleInput,
     RowwiseParallel,
     SequenceParallel,
 )
 from torch.testing._internal.common_distributed import (
+    ACCELERATOR_DIST_BACKENDS,
     MultiProcContinuousTest,
     MultiProcessTestCase,
     MultiThreadedTestCase,
@@ -129,12 +140,16 @@ class ModelArgs:
     use_attn_mask: bool = True
     weight_tying: bool = True
     checkpoint_activations: bool = False
+    num_experts: int = 0
 
 
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        assert args.dim % args.n_heads == 0
+        if args.dim % args.n_heads != 0:
+            raise AssertionError(
+                f"Expected args.dim % args.n_heads == 0, got {args.dim} % {args.n_heads}"
+            )
         self.head_dim = args.dim // args.n_heads
         self.n_heads = args.n_heads
         self.dropout_p = args.dropout_p
@@ -181,19 +196,247 @@ class FeedForward(nn.Module):
         return self.resid_dropout(self.w2(self.gelu(self.w1(x))))
 
 
+class Experts(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int, num_experts: int):
+        super().__init__()
+        self.num_experts = num_experts
+        self.w1 = nn.Parameter(torch.empty(num_experts, hidden_dim, dim))
+        self.w2 = nn.Parameter(torch.empty(num_experts, dim, hidden_dim))
+        self.reset_parameters()
+        self.gelu = nn.GELU()
+
+    def reset_parameters(self):
+        nn.init.normal_(self.w1, std=0.02)
+        nn.init.normal_(self.w2, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Weights are DTensors (sharded by EP/TP) but x is a plain tensor
+        # (dispatched by EP hooks), so extract local shards for bmm.
+        if isinstance(self.w1, DTensor):
+            w1, w2 = self.w1.to_local(), self.w2.to_local()
+        else:
+            w1, w2 = self.w1, self.w2
+        E = w1.shape[0]
+        x_exp = x.unsqueeze(0).expand(E, -1, -1)
+        h = self.gelu(torch.bmm(x_exp, w1.transpose(-2, -1)))
+        out = torch.bmm(h, w2.transpose(-2, -1))
+        return out.sum(dim=0)
+
+
+class ExpertLayer(nn.Module):
+    def __init__(self, num_experts: int, dim: int, hidden_dim: int):
+        super().__init__()
+        self.num_experts = num_experts
+        self.experts = Experts(dim=dim, hidden_dim=hidden_dim, num_experts=num_experts)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bs, slen, dim = x.shape
+        x_flat = x.view(-1, dim)
+        expert_out = self.experts(x_flat)
+        expert_out = expert_out / self.num_experts
+        return expert_out.view(bs, slen, dim)
+
+
+class TensorParallelForExpert(ParallelStyle):
+    """TP for Experts: shard w1 colwise (Shard(1)), w2 rowwise (Shard(2)).
+
+    For seq parallel, set input_layouts=Shard(0) and output_layouts=Shard(0)
+    to all-gather tokens before computation and reduce-scatter after.
+    """
+
+    def __init__(self, *, input_layouts=None, output_layouts=None):
+        super().__init__()
+        self.input_layouts = input_layouts
+        self.output_layouts = output_layouts or Replicate()
+
+    def _partition_fn(self, name, mod, device_mesh):
+        for pn, p in mod.named_parameters(recurse=False):
+            if pn == "w1":
+                placement = [Shard(1)]
+            elif pn == "w2":
+                placement = [Shard(2)]
+            else:
+                continue
+            mod.register_parameter(
+                pn, nn.Parameter(distribute_tensor(p, device_mesh, placement))
+            )
+
+    def _input_fn(self, mod, inputs, device_mesh):
+        if self.input_layouts is not None:
+            x = inputs[0]
+            x = (
+                DTensor.from_local(x, device_mesh, [self.input_layouts])
+                .redistribute(device_mesh, [Replicate()])
+                .to_local()
+            )
+            return (x,)
+        return inputs
+
+    def _output_fn(self, mod, outputs, device_mesh):
+        return (
+            DTensor.from_local(outputs, device_mesh, [Partial()])
+            .redistribute(device_mesh, [self.output_layouts])
+            .to_local()
+        )
+
+    def _apply(self, module, device_mesh):
+        return distribute_module(
+            module,
+            device_mesh,
+            partition_fn=self._partition_fn,
+            input_fn=self._input_fn,
+            output_fn=self._output_fn,
+        )
+
+
+class ExpertParallel(ParallelStyle):
+    """Distributes experts across ranks with Shard(0) on the expert dimension.
+
+    Dispatch: all-gather tokens so every rank sees all tokens.
+    Combine: reduce-scatter (sum) expert outputs back to token owners.
+    """
+
+    def _partition_fn(self, name: str, mod: nn.Module, device_mesh: DeviceMesh) -> None:
+        for param_name, param in mod.named_parameters(recurse=False):
+            dist_param = nn.Parameter(distribute_tensor(param, device_mesh, [Shard(0)]))
+            mod.register_parameter(param_name, dist_param)
+
+    def _token_dispatch(
+        self, mod: nn.Module, inputs: tuple, device_mesh: DeviceMesh
+    ) -> tuple[torch.Tensor]:
+        (x,) = inputs
+        x_gathered = all_gather_tensor_autograd(
+            x,
+            gather_dim=0,
+            group=device_mesh.get_group(),
+        )
+        x_gathered = torch.ops._c10d_functional.wait_tensor(x_gathered)
+        return (x_gathered,)
+
+    def _token_combine(
+        self, mod: nn.Module, output: torch.Tensor, device_mesh: DeviceMesh
+    ) -> torch.Tensor:
+        result = reduce_scatter_tensor_autograd(
+            output,
+            "sum",
+            scatter_dim=0,
+            group=device_mesh.get_group(),
+        )
+        result = torch.ops._c10d_functional.wait_tensor(result)
+        return result
+
+    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        return distribute_module(
+            module,
+            device_mesh,
+            partition_fn=self._partition_fn,
+            input_fn=self._token_dispatch,
+            output_fn=self._token_combine,
+        )
+
+
+class ExpertParallelWithTP(ParallelStyle):
+    """Combined EP + TP for experts.
+
+    Applied to ExpertLayer. Distributes expert params on a 2D (ep, tp) mesh
+    with [Shard(0), Shard(1/2)]. Token dispatch/combine hooks are registered
+    on ExpertLayer (outer), TP reduction hook on Experts (inner), so forward
+    execution is: EP dispatch -> TP input -> forward -> TP reduce -> EP combine.
+    """
+
+    def __init__(
+        self,
+        ep_mesh: DeviceMesh,
+        tp_mesh: DeviceMesh,
+    ):
+        super().__init__()
+        self.ep_mesh = ep_mesh
+        self.tp_mesh = tp_mesh
+        self.ep_tp_mesh = DeviceMesh._concatenate([ep_mesh, tp_mesh])
+
+    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        experts = module.experts  # type: ignore[attr-defined]
+
+        # Partition expert weights on 2D (ep, tp) mesh
+        for pn, p in experts.named_parameters(recurse=False):
+            if pn == "w1":
+                placements = [Shard(0), Shard(1)]
+            elif pn == "w2":
+                placements = [Shard(0), Shard(2)]
+            else:
+                continue
+            experts.register_parameter(
+                pn, nn.Parameter(distribute_tensor(p, self.ep_tp_mesh, placements))
+            )
+
+        # EP dispatch/combine hooks on ExpertLayer (outer module)
+        ep_mesh = self.ep_mesh
+
+        def ep_dispatch(mod, inputs):
+            (x,) = inputs
+            x = all_gather_tensor_autograd(x, gather_dim=0, group=ep_mesh.get_group())
+            return (torch.ops._c10d_functional.wait_tensor(x),)
+
+        def ep_combine(mod, inputs, output):
+            out = reduce_scatter_tensor_autograd(
+                output, "sum", scatter_dim=0, group=ep_mesh.get_group()
+            )
+            return torch.ops._c10d_functional.wait_tensor(out)
+
+        module.register_forward_pre_hook(ep_dispatch)
+        module.register_forward_hook(ep_combine)
+
+        # TP reduction hook on Experts (inner module)
+        tp_mesh = self.tp_mesh
+
+        def tp_allreduce_input_grad(mod, inputs):
+            (x,) = inputs
+            return (
+                DTensor.from_local(x, tp_mesh, [Replicate()]).to_local(
+                    grad_placements=[Partial()]
+                ),
+            )
+
+        experts.register_forward_pre_hook(tp_allreduce_input_grad)
+
+        def tp_reduce(mod, inputs, output):
+            return (
+                DTensor.from_local(output, tp_mesh, [Partial()])
+                .redistribute(tp_mesh, [Replicate()])
+                .to_local()
+            )
+
+        experts.register_forward_hook(tp_reduce)
+        return module
+
+
 class TransformerBlock(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.attention_norm = nn.LayerNorm(args.dim)
         self.attention = Attention(args)
         self.ffn_norm = nn.LayerNorm(args.dim)
-        self.feed_forward = FeedForward(
-            args.dim, hidden_dim=4 * args.dim, dropout_p=args.dropout_p
-        )
+
+        self.has_experts = args.num_experts > 0
+        if self.has_experts:
+            self.expert_layer = ExpertLayer(
+                args.num_experts,
+                dim=args.dim,
+                hidden_dim=4 * args.dim,
+            )
+        else:
+            self.feed_forward = FeedForward(
+                args.dim,
+                hidden_dim=4 * args.dim,
+                dropout_p=args.dropout_p,
+            )
 
     def forward(self, x):
         h = x + self.attention(self.attention_norm(x))
-        out = h + self.feed_forward(self.ffn_norm(h))
+        if self.has_experts:
+            out = h + self.expert_layer(self.ffn_norm(h))
+        else:
+            out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
 
@@ -202,8 +445,10 @@ class TransformerBlock(nn.Module):
 class Transformer(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        assert args.vocab_size is not None
-        assert args.max_seq_len is not None
+        if args.vocab_size is None:
+            raise AssertionError("Expected args.vocab_size to not be None")
+        if args.max_seq_len is None:
+            raise AssertionError("Expected args.max_seq_len to not be None")
         self.model_args = args
         self.max_seq_len = args.max_seq_len
         self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
@@ -220,7 +465,10 @@ class Transformer(nn.Module):
 
     def forward(self, tokens):
         _bsz, seq_len = tokens.size()
-        assert seq_len <= self.max_seq_len
+        if seq_len > self.max_seq_len:
+            raise AssertionError(
+                f"Expected seq_len <= max_seq_len, got {seq_len} > {self.max_seq_len}"
+            )
         h = self.tok_embeddings(tokens)
         pos = torch.arange(0, seq_len, device=tokens.device)
         p = self.pos_embeddings(pos)  # positional embeddings of shape (seq_len, dim)
@@ -238,96 +486,130 @@ class Transformer(nn.Module):
     @staticmethod
     def parallelize(
         module: "Transformer",
-        device_mesh: DeviceMesh,
+        tp_mesh: DeviceMesh | None,
         use_seq_parallel: bool,
         local_output_for_attn: bool = False,
+        ep_mesh: DeviceMesh | None = None,
     ) -> nn.Module:
-        assert isinstance(module, Transformer), f"Requires Transformer but got {module}"
-        # Parallelize the root submodules.
-        if use_seq_parallel:
-            root_plan = {
-                "tok_embeddings": RowwiseParallel(
-                    input_layouts=Replicate(), output_layouts=Shard(1)
-                ),
-                "pos_embeddings": RowwiseParallel(
-                    input_layouts=Replicate(), output_layouts=Shard(0)
-                ),
-                "norm": SequenceParallel(),
-            }
-        else:
-            root_plan = {
-                "tok_embeddings": RowwiseParallel(
-                    input_layouts=Replicate(), output_layouts=Replicate()
-                ),
-                "pos_embeddings": RowwiseParallel(
-                    input_layouts=Replicate(), output_layouts=Replicate()
-                ),
-            }
+        if not isinstance(module, Transformer):
+            raise AssertionError(f"Requires Transformer but got {module}")
+        if tp_mesh is None and ep_mesh is None:
+            raise ValueError("At least one of tp_mesh or ep_mesh must be provided")
 
-        module_tp = parallelize_module(module, device_mesh, root_plan)
-        # Parallelize the attention and feed forward submodules.
-        for layer in module_tp.layers:
-            layer_parallelize_plan = {}
+        # Parallelize the root submodules with TP.
+        if tp_mesh is not None:
             if use_seq_parallel:
-                layer_parallelize_plan["attention"] = PrepareModuleInput(
+                root_plan = {
+                    "tok_embeddings": RowwiseParallel(
+                        input_layouts=Replicate(), output_layouts=Shard(1)
+                    ),
+                    "pos_embeddings": RowwiseParallel(
+                        input_layouts=Replicate(), output_layouts=Shard(0)
+                    ),
+                    "norm": SequenceParallel(),
+                }
+            else:
+                root_plan = {
+                    "tok_embeddings": RowwiseParallel(
+                        input_layouts=Replicate(), output_layouts=Replicate()
+                    ),
+                    "pos_embeddings": RowwiseParallel(
+                        input_layouts=Replicate(), output_layouts=Replicate()
+                    ),
+                }
+            parallelize_module(module, tp_mesh, root_plan)
+
+        # Parallelize the attention and feed forward submodules.
+        for layer in module.layers:
+            if tp_mesh is not None:
+                layer_parallelize_plan = {}
+                if use_seq_parallel:
+                    layer_parallelize_plan["attention"] = PrepareModuleInput(
+                        input_layouts=Shard(1),
+                        desired_input_layouts=Replicate(),
+                    )
+                    # shard the RMSNorms
+                    layer_parallelize_plan["attention_norm"] = SequenceParallel()
+                    layer_parallelize_plan["ffn_norm"] = SequenceParallel()
+                layer_parallelize_plan["attention.wq"] = ColwiseParallel(
+                    use_local_output=local_output_for_attn
+                )
+                layer_parallelize_plan["attention.wk"] = ColwiseParallel(
+                    use_local_output=local_output_for_attn
+                )
+                layer_parallelize_plan["attention.wv"] = ColwiseParallel(
+                    use_local_output=local_output_for_attn
+                )
+                layer_parallelize_plan["attention.wo"] = (
+                    RowwiseParallel(output_layouts=Shard(1))
+                    if use_seq_parallel
+                    else RowwiseParallel()
+                )
+
+                if not layer.has_experts:
+                    layer_parallelize_plan["feed_forward.w1"] = (
+                        ColwiseParallel(input_layouts=Shard(1))
+                        if use_seq_parallel
+                        else ColwiseParallel()
+                    )
+                    layer_parallelize_plan["feed_forward.w2"] = (
+                        RowwiseParallel(output_layouts=Shard(1))
+                        if use_seq_parallel
+                        else RowwiseParallel()
+                    )
+                elif ep_mesh is None:
+                    # No EP mesh provided, use TP for experts
+                    layer_parallelize_plan["expert_layer.experts"] = (
+                        TensorParallelForExpert(
+                            input_layouts=Shard(0),
+                            output_layouts=Shard(0),
+                        )
+                        if use_seq_parallel
+                        else TensorParallelForExpert()
+                    )
+
+                parallelize_module(layer, tp_mesh, layer_parallelize_plan)
+
+            # EP (+ optional TP) for experts
+            if ep_mesh is not None and layer.has_experts:
+                if tp_mesh is not None:
+                    parallelize_module(
+                        layer.expert_layer,
+                        ep_mesh,
+                        ExpertParallelWithTP(ep_mesh, tp_mesh),
+                    )
+                else:
+                    parallelize_module(
+                        layer.expert_layer.experts, ep_mesh, ExpertParallel()
+                    )
+
+        if tp_mesh is not None:
+            # Parallelize the output submodule. If weight tying is enabled,
+            # we need to make sure output.weight is sharded consistently as
+            # tok_embeddings.weight, at the cost of the all_reduce operation
+            # using RowwiseParallel.
+            output_parallelize_plan = (
+                ColwiseParallel(
                     input_layouts=Shard(1),
-                    desired_input_layouts=Replicate(),
+                    output_layouts=Replicate(),
                 )
-                # shard the RMSNorms
-                layer_parallelize_plan["attention_norm"] = SequenceParallel()
-                layer_parallelize_plan["ffn_norm"] = SequenceParallel()
-            layer_parallelize_plan["attention.wq"] = ColwiseParallel(
-                use_local_output=local_output_for_attn
-            )
-            layer_parallelize_plan["attention.wk"] = ColwiseParallel(
-                use_local_output=local_output_for_attn
-            )
-            layer_parallelize_plan["attention.wv"] = ColwiseParallel(
-                use_local_output=local_output_for_attn
-            )
-            layer_parallelize_plan["attention.wo"] = (
-                RowwiseParallel(output_layouts=Shard(1))
                 if use_seq_parallel
-                else RowwiseParallel()
+                else ColwiseParallel(output_layouts=Replicate())
             )
+            parallelize_module(module.output, tp_mesh, output_parallelize_plan)
 
-            layer_parallelize_plan["feed_forward.w1"] = (
-                ColwiseParallel(input_layouts=Shard(1))
-                if use_seq_parallel
-                else ColwiseParallel()
-            )
-            layer_parallelize_plan["feed_forward.w2"] = (
-                RowwiseParallel(output_layouts=Shard(1))
-                if use_seq_parallel
-                else RowwiseParallel()
-            )
+            if local_output_for_attn:
+                for layer in module.layers:
+                    layer.attention.n_heads = (
+                        module.model_args.n_heads // tp_mesh.size()
+                    )
 
-            parallelize_module(layer, device_mesh, layer_parallelize_plan)
+            # Manually set output.weight so that parameters and gradients
+            # are shared.
+            if module.model_args.weight_tying:
+                module.output.weight = module.tok_embeddings.weight
 
-        # Parallelize the output submodule. If weight tying is enabled, we need to
-        # make sure output.weight is sharded consistently as tok_embeddings.weight,
-        # at the cost of the all_reduce operation using RowwiseParallel.
-        output_parallelize_plan = (
-            ColwiseParallel(
-                input_layouts=Shard(1),
-                output_layouts=Replicate(),
-            )
-            if use_seq_parallel
-            else ColwiseParallel(output_layouts=Replicate())
-        )
-        parallelize_module(module_tp.output, device_mesh, output_parallelize_plan)
-
-        if local_output_for_attn:
-            for layer in module_tp.layers:
-                layer.attention.n_heads = (
-                    module_tp.model_args.n_heads // device_mesh.size()
-                )
-
-        # Manually set output.weight so that parameters and gradients are shared.
-        if module_tp.model_args.weight_tying:
-            module_tp.output.weight = module_tp.tok_embeddings.weight
-
-        return module_tp
+        return module
 
 
 def skip_unless_torch_gpu(method: T) -> T:
@@ -360,6 +642,15 @@ class DTensorContinuousTestBase(MultiProcContinuousTest):
         backend = dist.get_default_backend_for_device(DEVICE_TYPE)
         return backend
 
+    @classmethod
+    def _init_pg(cls, rank, world_size, rdvz_file):
+        # Set device before initializing process group to ensure
+        # each rank is bound to the correct GPU
+        if torch.accelerator.is_available():
+            torch.accelerator.set_device_index(rank)
+        # Call parent's _init_pg to do the actual process group initialization
+        super()._init_pg(rank, world_size, rdvz_file)
+
 
 class DTensorTestBase(MultiProcessTestCase):
     @property
@@ -383,7 +674,7 @@ class DTensorTestBase(MultiProcessTestCase):
 
     @property
     def backend(self) -> str:
-        backend = dist.get_default_backend_for_device(DEVICE_TYPE)
+        backend = dist.get_default_backend_for_device(self.device_type)
         return backend
 
     def init_manual_seed_for_rank(self) -> None:
@@ -393,19 +684,24 @@ class DTensorTestBase(MultiProcessTestCase):
         return init_device_mesh(self.device_type, (self.world_size,))
 
     def init_pg(self, eager_init, backend: Optional[str] = None) -> None:
-        if "nccl" in self.backend and torch.cuda.device_count() < self.world_size:
+        if backend is None:
+            backend = self.backend
+
+        requires_gpu = any(
+            gpu_backend in backend for gpu_backend in ACCELERATOR_DIST_BACKENDS
+        )
+        if requires_gpu and torch.accelerator.device_count() < self.world_size:
             sys.exit(TEST_SKIPS[f"multi-gpu-{self.world_size}"].exit_code)
 
         curr_backend = dist.get_default_backend_for_device(self.device_type)
-
-        if backend is None:
-            backend = self.backend
 
         if backend not in [
             "nccl",
             "gloo",
             "mpi",
             f"cpu:gloo,{self.device_type}:{curr_backend}",
+            "cpu:gloo,cuda:ncclx",
+            "cuda:ncclx",
             "hccl",
             "xccl",
             "fake",
@@ -508,7 +804,8 @@ TestFunc = Callable[[...], object]
 
 # wrapper to initialize comms (processgroup)
 def with_comms(
-    eager_init: Union[TestFunc, bool] = False, backend: Optional[str] = None
+    eager_init: Union[TestFunc, bool] = False,
+    backend: Optional[str] = None,
 ) -> TestFunc:
     def decorator(func, eager_init: bool = False, backend: Optional[str] = None):
         @wraps(func)  # pyre-ignore[6]
@@ -517,6 +814,12 @@ def with_comms(
             *args: tuple[object],
             **kwargs: dict[str, Any],  # type: ignore[misc]
         ) -> None:
+            # just passthrough if harness doesn't
+            # support init_pg e.g., DTensorOpTestBase
+            if not hasattr(self, "init_pg"):
+                func(self, *args, **kwargs)
+                return
+
             self.init_pg(eager_init, backend)
 
             try:
@@ -560,12 +863,14 @@ class DTensorConverter:
         mesh: DeviceMesh,
         args: tuple[object, ...],
         kwargs: dict[str, object],
+        replicate_only: bool = False,
     ) -> None:
         self.hit = 0
         self.miss = 0
         self.mesh = mesh
         self.args = args
         self.kwargs = kwargs
+        self.replicate_only = replicate_only
         flatten_args, flatten_args_spec = tree_flatten(args)
         flatten_kwargs, flatten_kwargs_spec = tree_flatten(kwargs)
 
@@ -617,6 +922,10 @@ class DTensorConverter:
         )
 
     def gen_sharding_choices_for_arg(self, arg: torch.Tensor) -> Sequence[Placement]:
+        # If replicate_only is set, only use Replicate placement
+        if self.replicate_only:
+            return [Replicate()]
+
         mesh_size = self.mesh.size()
         sharding_choices: list[Placement] = [Replicate()]
         # c10d collective does not support bool tensor
@@ -705,6 +1014,68 @@ class DTensorConverter:
             raise RuntimeError(f"Trying to convert to DTensor, but got {type(t)}")
 
 
+class LocalDTensorOpTestBase(DTensorOpTestBase):
+    @property
+    def is_local_tensor_enabled(self) -> bool:
+        return True
+
+    def _handle_test_skip(self, msg: str) -> None:
+        self.skipTest(msg)
+
+    def _get_local_tensor_mode(self):
+        return LocalTensorMode(frozenset(range(self.world_size)))
+
+    def setUp(self) -> None:
+        super().setUp()
+        torch.autograd._enable_record_function(False)
+
+    def tearDown(self) -> None:
+        from torch.distributed.tensor import _random as random
+
+        random._rng_tracker = None
+        super().tearDown()
+        torch.autograd._enable_record_function(True)
+
+    @property
+    def rank(self):
+        return torch.SymInt(LocalIntNode({r: r for r in range(self.world_size)}))
+
+    @rank.setter
+    def rank(self, rank):
+        pass
+
+    def join_or_run(self, fn):
+        @wraps(fn)
+        def wrapper(self):
+            fn()
+
+        return types.MethodType(wrapper, self)
+
+    def build_device_mesh(self) -> DeviceMesh:
+        with maybe_disable_local_tensor_mode():
+            return super().build_device_mesh()
+
+    def init_pg(self, eager_init, backend: Optional[str] = None) -> None:
+        dist.init_process_group("fake", rank=0, world_size=self.world_size)
+        self._pg = dist.distributed_c10d._get_default_group()
+
+    def destroy_pg(self, device_id: Optional[int] = None) -> None:
+        dist.destroy_process_group(self._pg)
+        self._pg = None
+
+    def _spawn_processes(self) -> None:
+        pass
+
+    def _spawn_threads(self) -> None:
+        pass
+
+    def run_test(self, test_name: str, parent_pipe) -> None:
+        getattr(self, test_name)()
+
+    def init_manual_seed_for_rank(self) -> None:
+        torch.manual_seed(0)
+
+
 class LocalDTensorTestBase(DTensorTestBase):
     @property
     def is_local_tensor_enabled(self) -> bool:
@@ -721,6 +1092,9 @@ class LocalDTensorTestBase(DTensorTestBase):
         torch.autograd._enable_record_function(False)
 
     def tearDown(self) -> None:
+        from torch.distributed.tensor import _random as random
+
+        random._rng_tracker = None
         super().tearDown()
         torch.autograd._enable_record_function(True)
 
@@ -780,7 +1154,9 @@ def make_wrapped(fn, ctxs):
     return wrapped
 
 
-def create_local_tensor_test_class(orig_cls, skipped_tests=None):
+def create_local_tensor_test_class(
+    orig_cls, skipped_tests=None, base_class=LocalDTensorTestBase
+):
     if skipped_tests is None:
         skipped_tests = []
 
@@ -799,7 +1175,7 @@ def create_local_tensor_test_class(orig_cls, skipped_tests=None):
 
     cls = type(
         orig_cls.__name__ + "WithLocalTensor",
-        (LocalDTensorTestBase,) + orig_cls.__bases__,
+        (base_class,) + orig_cls.__bases__,
         dct,
     )
     cls.__file__ = __file__
@@ -814,3 +1190,182 @@ def map_local_tensor_for_rank(tensor, rank, func):
 @maybe_run_for_local_tensor
 def map_local_for_rank(rank, func):
     return func(rank)
+
+
+def reduce_local_int(val, func):
+    return func(val.node._local_ints)
+
+
+def _convert_shard_order_dict_to_ShardOrder(shard_order):
+    """Convert shard_order dict to ShardOrder"""
+    return tuple(
+        ShardOrderEntry(tensor_dim=tensor_dim, mesh_dims=tuple(mesh_dims))
+        for tensor_dim, mesh_dims in shard_order.items()
+    )
+
+
+# TODO(zpcore): remove once the native redistribute supports shard_order arg
+def redistribute(
+    dtensor_input,
+    device_mesh,
+    placements,
+    shard_order,
+    use_graph_based_transform=True,
+):
+    """
+    wrapper function to support shard_order for redistribution
+    This is a simpler version of Redistribute, only considers the forward.
+    """
+    if placements is None:
+        placements = shard_order_to_placement(shard_order, device_mesh)
+    placements = tuple(placements)
+    old_spec = dtensor_input._spec
+    new_spec = copy.deepcopy(old_spec)
+    new_spec.placements = placements
+    if shard_order is not None:
+        new_spec.shard_order = shard_order
+    else:
+        new_spec.shard_order = ()
+    if old_spec == new_spec:
+        return dtensor_input
+    dtensor_input = DTensor.from_local(
+        redistribute_local_tensor(
+            dtensor_input.to_local(),
+            old_spec,
+            new_spec,
+            use_graph_based_transform=use_graph_based_transform,
+        ),
+        device_mesh,
+    )
+    dtensor_input._spec = copy.deepcopy(new_spec)
+    return dtensor_input  # returns DTensor
+
+
+# TODO(zpcore): remove once the native distribute_tensor supports
+# shard_order arg
+def patched_distribute_tensor(
+    input_tensor,
+    device_mesh,
+    placements,
+    shard_order,
+    use_graph_based_transform=True,
+    src_data_rank: int | None = 0,
+):
+    """wrapper function to support shard_order for tensor distribution"""
+    if placements is None:
+        placements = shard_order_to_placement(shard_order, device_mesh)
+    placements = tuple(placements)
+    tensor_dt = distribute_tensor(
+        input_tensor, device_mesh, placements, src_data_rank=src_data_rank
+    )
+    # Do not consider _StridedShard to express shard order
+    tensor_dt._spec.use_strided_shard_as_shard_order = False
+    tensor_dt._spec.__post_init__()
+    # fix the shard order
+    return redistribute(
+        tensor_dt, device_mesh, placements, shard_order, use_graph_based_transform
+    )
+
+
+# TODO(zpcore): remove once the native redistribute supports shard_order arg
+def make_full_tensor(dtensor_input):
+    """wrapper function to support DTensor.full_tensor"""
+    return redistribute(
+        dtensor_input, dtensor_input.device_mesh, placements=None, shard_order=()
+    ).to_local()
+
+
+def shard_order_to_placement(shard_order, mesh):
+    """convert shard_order to placement with only Replicate() and Shard()"""
+    placements: list[Any] = [Replicate() for _ in range(mesh.ndim)]
+    if shard_order is not None:
+        for entry in shard_order:
+            tensor_dim = entry.tensor_dim
+            mesh_dims = entry.mesh_dims
+            for mesh_dim in mesh_dims:
+                placements[mesh_dim] = Shard(tensor_dim)
+    return tuple(placements)
+
+
+def generate_shard_orders(mesh, tensor_rank):
+    # Generate all possible sharding placement of tensor with rank
+    # `tensor_rank` over mesh.
+    def _split_list(lst: list, N: int):
+        def compositions(n: int, k: int):
+            # yields lists of length k, positive ints summing to n
+            for cuts in itertools.combinations(range(1, n), k - 1):
+                # add 0 and n as sentinels, then take consecutive differences
+                yield [b - a for a, b in itertools.pairwise((0, *cuts, n))]
+
+        length = len(lst)
+        for comp in compositions(length, N):
+            result = []
+            start = 0
+            for size in comp:
+                result.append(lst[start : start + size])
+                start += size
+            yield result
+
+    all_mesh = list(range(mesh.ndim))
+    all_device_order = list(itertools.permutations(all_mesh))
+    for device_order in all_device_order:
+        # split on device orders, and assign each device order segment to a tensor dim
+        for num_split in range(1, mesh.ndim + 1):
+            for splitted_list in _split_list(list(range(mesh.ndim)), num_split):
+                for tensor_dims in itertools.combinations(
+                    range(tensor_rank), len(splitted_list)
+                ):
+                    shard_order = {}
+                    if len(tensor_dims) != len(splitted_list):
+                        raise AssertionError(
+                            f"Expected len(tensor_dims) == len(splitted_list), "
+                            f"got {len(tensor_dims)} != {len(splitted_list)}"
+                        )
+                    for tensor_dim, mesh_dims in zip(tensor_dims, splitted_list):
+                        shard_order[tensor_dim] = device_order[
+                            mesh_dims[0] : mesh_dims[-1] + 1
+                        ]
+                    yield _convert_shard_order_dict_to_ShardOrder(shard_order)
+
+
+def validate_sharding_rule_sample(
+    op, full_args, full_kwargs, input_placements, output_placements, device_mesh
+):
+    from torch.utils import _pytree as pytree
+
+    # Extract tensors from args in order, pair with placements
+    full_tensors = [
+        a for a in pytree.tree_leaves(full_args) if isinstance(a, torch.Tensor)
+    ]
+    full_tensors += [
+        a for a in pytree.tree_leaves(full_kwargs) if isinstance(a, torch.Tensor)
+    ]
+
+    dtensors = [
+        distribute_tensor(t, device_mesh, (p,))
+        for t, p in zip(full_tensors, input_placements)
+    ]
+
+    # Build sharded args by replacing tensors with their sharded local versions
+    dtensor_idx = 0
+
+    def _to_local_shard(a):
+        nonlocal dtensor_idx
+        if isinstance(a, torch.Tensor):
+            local = dtensors[dtensor_idx].to_local()
+            dtensor_idx += 1
+            return local
+        return a
+
+    local_args, local_kwargs = pytree.tree_map(
+        _to_local_shard, (full_args, full_kwargs)
+    )
+
+    # run and compare
+    ref_output = op(*full_args, **full_kwargs)
+    local_output = op(*local_args, **local_kwargs)
+    output_dt = DTensor.from_local(local_output, device_mesh, output_placements)
+    full_output = output_dt.redistribute(device_mesh, (Replicate(),)).to_local()
+    return ref_output.shape == full_output.shape and torch.allclose(
+        ref_output, full_output, atol=1e-5, rtol=1e-5
+    )

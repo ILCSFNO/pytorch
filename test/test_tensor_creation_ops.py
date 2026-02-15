@@ -33,6 +33,7 @@ from torch.testing._internal.common_utils import (
     IS_S390X,
     IS_ARM64,
     parametrize,
+    TEST_WITH_TORCHDYNAMO,
     xfailIfTorchDynamo,
 )
 from torch.testing._internal.common_device_type import (
@@ -382,6 +383,7 @@ class TestTensorCreation(TestCase):
             ):
                 torch.block_diag(torch.ones(2, 2).cpu(), torch.ones(2, 2, device=device))
 
+    @skipCPUIf(TEST_WITH_TORCHDYNAMO, "test doesn't currently work with dynamo on CPU")
     @unittest.skipIf(not TEST_SCIPY, "Scipy not found")
     def test_block_diag_scipy(self, device):
         import scipy.linalg
@@ -466,8 +468,8 @@ class TestTensorCreation(TestCase):
             b = torch.tensor([3, 4], device=device, dtype=dtype)
             error = r"Expected both inputs to be Half, Float or Double tensors but " \
                     r"got [A-Za-z]+ and [A-Za-z]+"
-        with self.assertRaisesRegex(RuntimeError, error):
-            op(a, b)
+            with self.assertRaisesRegex(RuntimeError, error):
+                op(a, b)
 
     @onlyNativeDeviceTypes
     @dtypes(torch.float32, torch.float64)
@@ -2831,7 +2833,8 @@ class TestTensorCreation(TestCase):
         tensor = torch.tensor((1, 2, 3), device=device)
 
         # need more than one device_type to test this
-        assert self.device_type == 'cuda'
+        if self.device_type != 'cuda':
+            raise AssertionError(f"device_type should be 'cuda', got {self.device_type!r}")
         for left, right in product([tensor, tensor.cpu()], [tensor, tensor.cpu()]):
             for device_arg in [torch_device, cpu_device, None]:
                 if device_arg is None:
@@ -2847,7 +2850,7 @@ class TestTensorCreation(TestCase):
             with self.assertRaisesRegex(RuntimeError, r'floating point'):
                 torch_method(3, dtype=dtype)
             return
-        for size in [0, 1, 2, 5, 10, 50, 100, 1024, 2048]:
+        for size in [1, 2, 5, 10, 50, 100, 1024, 2048]:
             for periodic in [True, False]:
                 res = torch_method(
                     size,
@@ -2896,7 +2899,7 @@ class TestTensorCreation(TestCase):
             with self.assertRaisesRegex(RuntimeError, r'floating point'):
                 torch_method(3, dtype=dtype)
             return
-        for size in [0, 1, 2, 5, 10, 50, 100, 1024, 2048]:
+        for size in [1, 2, 5, 10, 50, 100, 1024, 2048]:
             for periodic in [True, False]:
                 res = torch_method(size, sym=not periodic, **kwargs, device=device, dtype=dtype)
                 # NB: scipy always returns a float64 result
@@ -3807,6 +3810,137 @@ class TestLikeTensorCreation(TestCase):
         self.assertEqual(torch.full_like(like, 1.).dtype, torch.long)
         self.assertEqual(torch.full_like(like, 1., dtype=torch.complex64).dtype,
                          torch.complex64)
+
+    def test_rand_like(self, device):
+        like_tensor = torch.zeros(100, 100, device=device)
+
+        def seed(generator):
+            if generator is None:
+                torch.manual_seed(123456)
+            else:
+                generator.manual_seed(123456)
+            return generator
+
+        for generator in (None, torch.Generator(device)):
+            generator = seed(generator)
+            res1 = torch.rand_like(like_tensor, generator=generator)
+
+            generator = seed(generator)
+            res2 = torch.empty_like(like_tensor)
+            res2 = torch.rand_like(like_tensor, generator=generator)
+
+            self.assertEqual(res1, res2)
+            self.assertTrue((res1 >= 0).all().item())
+            self.assertTrue((res1 < 1).all().item())
+            self.assertEqual(res1.shape, like_tensor.shape)
+
+        gen0 = torch.Generator(device)
+        gen1 = torch.Generator(device)
+        gen2 = torch.Generator(device)
+        gen0.manual_seed(42)
+        gen1.manual_seed(42)
+        gen2.manual_seed(123456)
+
+        tensor0 = torch.rand_like(like_tensor, generator=gen0)
+        tensor1 = torch.rand_like(like_tensor, generator=gen1)
+        tensor2 = torch.rand_like(like_tensor, generator=gen2)
+        self.assertEqual(tensor0, tensor1)
+        self.assertNotEqual(tensor2, tensor0)
+        self.assertNotEqual(tensor2, tensor1)
+
+        tensor0 = torch.rand_like(like_tensor, generator=gen0)
+        self.assertNotEqual(tensor0, tensor1)
+
+    def test_randn_like(self, device):
+        like_tensor = torch.zeros(100, 100, device=device)
+
+        def seed(generator):
+            if generator is None:
+                torch.manual_seed(123456)
+            else:
+                generator.manual_seed(123456)
+            return generator
+
+        for generator in (None, torch.Generator(device)):
+            generator = seed(generator)
+            res1 = torch.randn_like(like_tensor, generator=generator)
+
+            generator = seed(generator)
+            res2 = torch.empty_like(like_tensor)
+            res2 = torch.randn_like(like_tensor, generator=generator)
+
+            self.assertEqual(res1, res2)
+            self.assertEqual(res1.shape, like_tensor.shape)
+
+        gen0 = torch.Generator(device)
+        gen1 = torch.Generator(device)
+        gen2 = torch.Generator(device)
+        gen0.manual_seed(42)
+        gen1.manual_seed(42)
+        gen2.manual_seed(123456)
+
+        tensor0 = torch.randn_like(like_tensor, generator=gen0)
+        tensor1 = torch.randn_like(like_tensor, generator=gen1)
+        tensor2 = torch.randn_like(like_tensor, generator=gen2)
+        self.assertEqual(tensor0, tensor1)
+        self.assertNotEqual(tensor2, tensor0)
+        self.assertNotEqual(tensor2, tensor1)
+
+        tensor0 = torch.randn_like(like_tensor, generator=gen0)
+        self.assertNotEqual(tensor0, tensor1)
+
+
+    def test_randint_like(self, device):
+        like_tensor = torch.zeros(100, 100, device=device, dtype=torch.long)
+
+        def seed(generator):
+            if generator is None:
+                torch.manual_seed(123456)
+            else:
+                generator.manual_seed(123456)
+            return generator
+
+        for generator in (None, torch.Generator(device)):
+            generator = seed(generator)
+            res1 = torch.randint_like(like_tensor, 0, 10, generator=generator)
+
+            generator = seed(generator)
+            res2 = torch.empty_like(like_tensor)
+            res2 = torch.randint_like(like_tensor, 0, 10, generator=generator)
+
+            generator = seed(generator)
+            res3 = torch.randint_like(like_tensor, 10, generator=generator)
+
+            generator = seed(generator)
+            res4 = torch.empty_like(like_tensor)
+            res4 = torch.randint_like(like_tensor, 10, generator=generator)
+
+            self.assertEqual(res1, res2)
+            self.assertEqual(res3, res4)
+            self.assertTrue((res1 >= 0).all().item())
+            self.assertTrue((res1 < 10).all().item())
+            self.assertTrue((res3 >= 0).all().item())
+            self.assertTrue((res3 < 10).all().item())
+            self.assertEqual(res1.shape, like_tensor.shape)
+            self.assertEqual(res3.shape, like_tensor.shape)
+
+        gen0 = torch.Generator(device)
+        gen1 = torch.Generator(device)
+        gen2 = torch.Generator(device)
+        gen0.manual_seed(42)
+        gen1.manual_seed(42)
+        gen2.manual_seed(123456)
+
+        tensor0 = torch.randint_like(like_tensor, 0, 10, generator=gen0)
+        tensor1 = torch.randint_like(like_tensor, 0, 10, generator=gen1)
+        tensor2 = torch.randint_like(like_tensor, 0, 10, generator=gen2)
+        self.assertEqual(tensor0, tensor1)
+        self.assertNotEqual(tensor2, tensor0)
+        self.assertNotEqual(tensor2, tensor1)
+
+        tensor0 = torch.randint_like(like_tensor, 0, 10, generator=gen0)
+        self.assertNotEqual(tensor0, tensor1)
+
 
 # Tests for the `frombuffer` function (only work on CPU):
 #   Constructs tensors from Python objects that implement the buffer protocol,

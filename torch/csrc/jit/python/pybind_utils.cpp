@@ -1,4 +1,3 @@
-#include <torch/csrc/jit/ir/graph_utils.h>
 #include <torch/csrc/jit/python/module_python.h>
 #include <torch/csrc/jit/python/pybind_utils.h>
 #include <torch/csrc/jit/python/python_dict.h>
@@ -6,9 +5,12 @@
 #include <torch/csrc/jit/python/python_list.h>
 #include <torch/csrc/jit/python/utf8_decoding_ignore.h>
 
+#ifdef USE_DISTRIBUTED
+#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
+#endif
+
 #include <ATen/ScalarOps.h>
 
-#include <c10/core/QScheme.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/utils/python_arg_parser.h>
 
@@ -383,7 +385,7 @@ IValue toIValue(py::handle obj, const TypePtr& type, std::optional<int32_t> N) {
       try {
         auto script_dict = py::cast<ScriptDict>(obj);
         return script_dict.dict_;
-      } catch (py::cast_error& e) {
+      } catch (py::cast_error&) {
       }
 
       // If not (i.e. it is a regular Python dictionary), make a new
@@ -540,6 +542,15 @@ IValue toIValue(py::handle obj, const TypePtr& type, std::optional<int32_t> N) {
       return c10::ivalue::ConcretePyObjectHolder::create(obj);
     }
     case TypeKind::CapsuleType: {
+#ifdef USE_DISTRIBUTED
+      // Handle ProcessGroup custom class as a capsule
+      if (py::isinstance<c10d::ProcessGroup>(obj)) {
+        auto cpp_obj = obj.cast<c10::intrusive_ptr<c10d::ProcessGroup>>();
+        return IValue::make_capsule(cpp_obj);
+      }
+#endif
+
+      // Original: handle generic c10::Capsule Python objects
       return IValue::make_capsule(py::cast<c10::Capsule>(obj).obj_ptr);
     }
     case TypeKind::FutureType: {
@@ -587,7 +598,9 @@ py::object toPyObject(IValue ivalue) {
   } else if (ivalue.isTensor()) {
     auto tensor = std::move(ivalue).toTensor();
     if (tensor.unsafeGetTensorImpl()->is_wrapped_number()) {
-      TORCH_INTERNAL_ASSERT(tensor.device().is_cpu());
+      TORCH_INTERNAL_ASSERT(
+          tensor.device().is_cpu() ||
+          (tensor._is_zerotensor() && tensor.dim() == 0));
       auto py_tensor = py::cast(tensor);
       if (PyObject_HasAttrString(py_tensor.ptr(), "_wrapped_number")) {
         return py_tensor.attr("_wrapped_number");
@@ -595,17 +608,27 @@ py::object toPyObject(IValue ivalue) {
       auto scalar_type = tensor.scalar_type();
       switch (scalar_type) {
         case at::ScalarType::Bool:
-          return py::cast(*tensor.const_data_ptr<bool>());
+          return (tensor._is_zerotensor())
+              ? py::cast(false)
+              : py::cast(*tensor.const_data_ptr<bool>());
         case at::ScalarType::Long:
-          return py::cast(*tensor.const_data_ptr<int64_t>());
+          return (tensor._is_zerotensor())
+              ? py::cast(int64_t(0))
+              : py::cast(*tensor.const_data_ptr<int64_t>());
         case at::ScalarType::UInt64:
-          return py::cast(*tensor.const_data_ptr<uint64_t>());
+          return (tensor._is_zerotensor())
+              ? py::cast(uint64_t(0))
+              : py::cast(*tensor.const_data_ptr<uint64_t>());
         case at::ScalarType::Double:
-          return py::cast(*tensor.const_data_ptr<double>());
+          return (tensor._is_zerotensor())
+              ? py::cast(0.0)
+              : py::cast(*tensor.const_data_ptr<double>());
         case at::ScalarType::ComplexDouble:
           // TODO: https://github.com/pytorch/pytorch/issues/77134
-          return py::cast(static_cast<std::complex<double>>(
-              *tensor.const_data_ptr<c10::complex<double>>()));
+          return (tensor._is_zerotensor())
+              ? py::cast(std::complex<double>(0.0, 0.0))
+              : py::cast(static_cast<std::complex<double>>(
+                    *tensor.const_data_ptr<c10::complex<double>>()));
         default:
           TORCH_CHECK(
               false,
@@ -742,7 +765,17 @@ py::object toPyObject(IValue ivalue) {
     // PyObject
     return py::reinterpret_borrow<py::object>(ivalue.toPyObject());
   } else if (ivalue.isCapsule()) {
-    return py::cast(c10::Capsule(ivalue.toCapsule()));
+    auto capsule = ivalue.toCapsule();
+#ifdef USE_DISTRIBUTED
+    {
+      auto pg = c10::static_intrusive_pointer_cast<c10d::ProcessGroup>(capsule);
+      if (pg != nullptr) {
+        // ProcessGroup is a torch custom class, return it directly
+        return py::cast(pg);
+      }
+    }
+#endif
+    return py::cast(c10::Capsule(capsule));
   } else if (ivalue.isFuture()) {
     return py::cast(std::make_shared<PythonFutureWrapper>(ivalue.toFuture()));
   } else if (ivalue.isAwait()) {
@@ -966,6 +999,16 @@ py::object _get_operation_for_overload_or_packet(
   return torch_function_called
       ? *res
       : invokeOperatorFromPython(operations, args, kwargs, dk);
+}
+
+std::optional<InferredType> detail::_tryToInferTypeImpl(py::handle input) {
+#ifdef USE_DISTRIBUTED
+  if (py::isinstance<c10d::ProcessGroup>(input)) {
+    return InferredType(CapsuleType::get());
+  }
+#endif
+
+  return std::nullopt;
 }
 
 } // namespace torch::jit

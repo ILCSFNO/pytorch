@@ -4,8 +4,9 @@
 
 import functools
 import unittest
+from collections.abc import Callable
 from contextlib import contextmanager, ExitStack
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import torch
 import torch._dynamo
@@ -15,6 +16,7 @@ import torch._inductor.decomposition
 import torch.fx.traceback as fx_traceback
 import torch.nn.functional as F
 from torch import nn
+from torch._dynamo.functional_export import dynamo_graph_capture_for_export
 from torch._dynamo.variables.higher_order_ops import LocalMapWrappedHigherOrderVariable
 from torch._functorch.aot_autograd import aot_export_joint_with_descriptors
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -51,24 +53,6 @@ def enable_local_map_wrapping():
         yield
 
 
-def _export(model: torch.nn.Module, inputs: tuple[Any]) -> torch.nn.Module:
-    from torch._dynamo.functional_export import _dynamo_graph_capture_for_export
-    from torch.export._trace import _restore_state_dict
-
-    """
-    Thin wrapper around graph capture output that restores the
-    original calling convention and attribute fqn. TODO:
-    1) Use bytecode for calling convention instead of pytree for more
-       seamless UX.
-    2) Attach guards
-    3) Be more careful about tensor constants names.
-    """
-    with torch._dynamo.config.patch(install_free_tensors=True):
-        gm = _dynamo_graph_capture_for_export(model)(*inputs)
-        _restore_state_dict(model, gm)
-        return gm
-
-
 def ap_style_initial_capture(
     model: torch.nn.Module, inputs_fn: Callable
 ) -> torch.nn.Module:
@@ -84,13 +68,14 @@ def ap_style_initial_capture(
 
     with fake_mode:
         inputs = inputs_fn()
-    assert isinstance(inputs, tuple)
+    if not isinstance(inputs, tuple):
+        raise AssertionError(f"Expected inputs to be tuple, got {type(inputs)}")
 
     with (
         enable_local_map_wrapping(),
         torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing(),
     ):
-        torch_ir_with_fqn = _export(model, inputs)
+        torch_ir_with_fqn = dynamo_graph_capture_for_export(model)(*inputs)
         unused = ExitStack()
         joint_with_descriptors = aot_export_joint_with_descriptors(
             unused,
@@ -198,7 +183,8 @@ def create_model(attention_fn, nheads, dim1, dim2, sac_policy=None):
 
 
 def get_local_mapped_functions(mesh):
-    assert torch.distributed.is_available()
+    if not torch.distributed.is_available():
+        raise AssertionError("torch.distributed is not available")
 
     @local_map(
         out_placements=((Shard(0), Shard(1), Shard(2)),),
@@ -302,47 +288,31 @@ class GraphModule(torch.nn.Module):
         l_self_modules_wo_parameters_weight_ = L_self_modules_wo_parameters_weight_
         l_self_modules_w1_parameters_weight_ = L_self_modules_w1_parameters_weight_
         l_self_modules_w2_parameters_weight_ = L_self_modules_w2_parameters_weight_
-
         q: "f32[8, 16, 96]" = torch._C._nn.linear(l_x_, l_self_modules_wq_parameters_weight_, None);  l_self_modules_wq_parameters_weight_ = None
-
         k: "f32[8, 16, 96]" = torch._C._nn.linear(l_x_, l_self_modules_wk_parameters_weight_, None);  l_self_modules_wk_parameters_weight_ = None
-
         v: "f32[8, 16, 96]" = torch._C._nn.linear(l_x_, l_self_modules_wv_parameters_weight_, None);  l_self_modules_wv_parameters_weight_ = None
-
         unflatten: "f32[8, 16, 16, 6]" = q.unflatten(-1, (16, -1));  q = None
         q_1: "f32[8, 16, 16, 6]" = unflatten.permute(0, 2, 1, 3);  unflatten = None
-
         unflatten_1: "f32[8, 16, 16, 6]" = k.unflatten(-1, (16, -1));  k = None
         k_1: "f32[8, 16, 16, 6]" = unflatten_1.permute(0, 2, 1, 3);  unflatten_1 = None
-
         unflatten_2: "f32[8, 16, 16, 6]" = v.unflatten(-1, (16, -1));  v = None
         v_1: "f32[8, 16, 16, 6]" = unflatten_2.permute(0, 2, 1, 3);  unflatten_2 = None
-
         subgraph_0 = self.subgraph_0
         local_map_hop = torch.ops.higher_order.local_map_hop(subgraph_0, q_1, k_1, v_1);  subgraph_0 = q_1 = k_1 = v_1 = None
-        o: "f32[8, 16, 16, 6]" = local_map_hop[0];  local_map_hop = None
-
-        permute_3: "f32[8, 16, 16, 6]" = o.permute(0, 2, 1, 3);  o = None
-        o_1: "f32[8, 16, 96]" = permute_3.flatten(-2);  permute_3 = None
-
-        o_2: "f32[8, 16, 96]" = torch._C._nn.linear(o_1, l_self_modules_wo_parameters_weight_, None);  o_1 = l_self_modules_wo_parameters_weight_ = None
-
-        o0: "f32[8, 16, 96]" = o_2 + l_x_;  o_2 = l_x_ = None
-
-        o_3: "f32[8, 16, 384]" = torch._C._nn.linear(o0, l_self_modules_w1_parameters_weight_, None);  l_self_modules_w1_parameters_weight_ = None
-
-        o_4: "f32[8, 16, 384]" = torch.nn.functional.relu(o_3);  o_3 = None
-
-        o_5: "f32[8, 16, 96]" = torch._C._nn.linear(o_4, l_self_modules_w2_parameters_weight_, None);  o_4 = l_self_modules_w2_parameters_weight_ = None
-
-        o_6: "f32[8, 16, 96]" = o0 + o_5;  o0 = o_5 = None
-        return (o_6,)
-
+        getitem: "f32[8, 16, 16, 6]" = local_map_hop[0];  local_map_hop = None
+        permute_3: "f32[8, 16, 16, 6]" = getitem.permute(0, 2, 1, 3);  getitem = None
+        o: "f32[8, 16, 96]" = permute_3.flatten(-2);  permute_3 = None
+        o_1: "f32[8, 16, 96]" = torch._C._nn.linear(o, l_self_modules_wo_parameters_weight_, None);  o = l_self_modules_wo_parameters_weight_ = None
+        o0: "f32[8, 16, 96]" = o_1 + l_x_;  o_1 = l_x_ = None
+        o_2: "f32[8, 16, 384]" = torch._C._nn.linear(o0, l_self_modules_w1_parameters_weight_, None);  l_self_modules_w1_parameters_weight_ = None
+        o_3: "f32[8, 16, 384]" = torch.nn.functional.relu(o_2);  o_2 = None
+        o_4: "f32[8, 16, 96]" = torch._C._nn.linear(o_3, l_self_modules_w2_parameters_weight_, None);  o_3 = l_self_modules_w2_parameters_weight_ = None
+        o_5: "f32[8, 16, 96]" = o0 + o_4;  o0 = o_4 = None
+        return (o_5,)
     class subgraph_0(torch.nn.Module):
         def forward(self, q_1: "f32[1, 2, 4, 6]", k_1: "f32[1, 2, 16, 6]", v_1: "f32[1, 2, 16, 6]"):
             out: "f32[1, 2, 4, 6]" = torch._C._nn.scaled_dot_product_attention(query = q_1, key = k_1, value = v_1, is_causal = False);  q_1 = k_1 = v_1 = None
-            return (out,)
-""",
+            return (out,)""",
                 ignore_empty_lines=True,
             )
 
@@ -591,7 +561,8 @@ class GraphModule(torch.nn.Module):
     @unittest.skipIf(*get_skip_reasons())
     def test_local_map_with_local_shapes_hop_tracing(self):
         def fn(x):
-            assert x.shape == (10, 80), "expected local shapes"
+            if x.shape != (10, 80):
+                raise AssertionError("expected local shapes")
             # force view specialization ops
             out = x.view(-1) + 10
             return (out.view(x.shape),)
@@ -641,19 +612,27 @@ class GraphModule(torch.nn.Module):
 
         # Graph should not be aware that Fake key used local shapes
         fw_inputs = fw_node.args
-        assert len(fw_inputs) == 1
+        if len(fw_inputs) != 1:
+            raise AssertionError(f"Expected len(fw_inputs) == 1, got {len(fw_inputs)}")
         self.assertEqual(fw_inputs[0].meta["val"].shape, (80, 80))
 
         fw_outputs = fw_node.args
-        assert len(fw_outputs) == 1
+        if len(fw_outputs) != 1:
+            raise AssertionError(
+                f"Expected len(fw_outputs) == 1, got {len(fw_outputs)}"
+            )
         self.assertEqual(fw_outputs[0].meta["val"].shape, (80, 80))
 
         bw_inputs = bw_node.args
-        assert len(bw_inputs) == 1
+        if len(bw_inputs) != 1:
+            raise AssertionError(f"Expected len(bw_inputs) == 1, got {len(bw_inputs)}")
         self.assertEqual(bw_inputs[0].meta["val"].shape, (80, 80))
 
         bw_outputs = bw_node.meta["val"]
-        assert len(bw_outputs) == 1
+        if len(bw_outputs) != 1:
+            raise AssertionError(
+                f"Expected len(bw_outputs) == 1, got {len(bw_outputs)}"
+            )
         self.assertEqual(bw_outputs[0].shape, (80, 80))
 
     @unittest.skipIf(*get_skip_reasons())
@@ -783,10 +762,11 @@ class GraphModule(torch.nn.Module):
         ):
             group_size = c10d._get_group_size_by_name(group_name)
             if output_split_sizes is None or input_split_sizes is None:
-                assert output_split_sizes is None and input_split_sizes is None, (
-                    "output_split_sizes and input_split_sizes must either be "
-                    "specified together or both set to None"
-                )
+                if not (output_split_sizes is None and input_split_sizes is None):
+                    raise AssertionError(
+                        "output_split_sizes and input_split_sizes must either be "
+                        "specified together or both set to None"
+                    )
                 output_split_sizes = [self.shape[0] // group_size] * group_size
                 input_split_sizes = output_split_sizes
 
@@ -943,8 +923,8 @@ class GraphModule(torch.nn.Module):
             op="call_function", target=torch.ops.aten.mm.default
         )
         self.assertEqual(len(mm_nodes), 4)
-        self.assertNotIn("partitioner_tag", mm_nodes[0].meta)
-        self.assertNotIn("partitioner_tag", mm_nodes[1].meta)
+        self.assertEqual(mm_nodes[0].meta["partitioner_tag"], "is_forward")
+        self.assertEqual(mm_nodes[1].meta["partitioner_tag"], "is_forward")
         self.assertEqual(mm_nodes[2].meta["partitioner_tag"], "is_backward")
         self.assertEqual(mm_nodes[3].meta["partitioner_tag"], "is_backward")
         self.assertEqual(mm_nodes[0].meta["custom"]["inside_local_map"], 0)

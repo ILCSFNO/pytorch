@@ -4,10 +4,10 @@ import inspect
 import logging
 import math
 import operator
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable, cast
+from typing import Any, cast
 
 import torch
 import torch.fx as fx
@@ -97,7 +97,7 @@ def get_comm_block(comm_node: fx.Node) -> CommBlock | None:
         # Collective with only one output
         node_list = [comm_node, first_user]
         wait_nodes.append(first_user)
-    elif len(comm_node.users) > 1 and first_user.target == operator.getitem:
+    elif len(comm_node.users) > 1 and first_user.target is operator.getitem:
         # Collective with only more than one output
         node_list.append(comm_node)
         for user in comm_node.users:
@@ -308,7 +308,7 @@ def _scatter_fused_allreduce_waits(
     # in orig_comm_blocks. This index will be later used to determine what users
     # nodes need to be move to maintain a correct topological sort order.
     last_wait_node_idx = 0
-    # pyrefly: ignore [bad-assignment]
+
     for node in graph.nodes:
         last_wait_node_idx = max(
             node_indices.get(node, last_wait_node_idx), last_wait_node_idx
@@ -358,7 +358,7 @@ def _scatter_fused_allreduce_waits(
             user_node = nodes.popleft()
             if not isinstance(user_node, fx.Node):
                 continue
-            # pyrefly: ignore [unsupported-operation]
+
             if node_indices[user_node] < last_wait_node_idx:
                 incorrect_order_nodes.append(user_node)
                 nodes.extend(list(user_node.users))

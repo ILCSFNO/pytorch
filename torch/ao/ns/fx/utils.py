@@ -3,7 +3,6 @@
 import enum
 import operator
 from collections.abc import Callable
-from typing import Optional, Union
 
 import torch
 import torch.ao.nn.intrinsic.quantized as nniq
@@ -175,7 +174,7 @@ def get_node_input_qparams(
     node: Node,
     gm: GraphModule,
     node_type_to_io_type_map: dict[str, set[NSNodeTargetType]],
-) -> Optional[tuple[Union[torch.Tensor, float], Union[torch.Tensor, int]]]:
+) -> tuple[torch.Tensor | float, torch.Tensor | int] | None:
     """
     Returns the qparams (scale, zero_point) of the first input to `node`,
     if they can be inferred from the graph.
@@ -496,7 +495,7 @@ def compute_normalized_l2_error(x: torch.Tensor, y: torch.Tensor) -> torch.Tenso
     Return:
         float or tuple of floats
     """
-    # pyrefly: ignore [unsupported-operation]
+
     return torch.sqrt(((x - y) ** 2).sum() / (x**2).sum())
 
 

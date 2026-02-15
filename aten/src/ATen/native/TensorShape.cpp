@@ -1711,6 +1711,29 @@ Tensor narrow_symint(
       "], but got ",
       start,
       ")")
+
+  auto cond1 = TORCH_GUARD_OR_FALSE(start.sym_lt(0));
+  auto cond2 = TORCH_GUARD_OR_FALSE(start.sym_ge(0));
+
+  if (cond1 || cond2) {
+    if (cond1) {
+      start = start + cur_size;
+    }
+
+    TORCH_SYM_CHECK(
+        start.sym_le(cur_size - length),
+        "start (",
+        start,
+        ") + length (",
+        length,
+        ") exceeds dimension size (",
+        cur_size,
+        ").");
+    return at::slice_symint(self, dim, start, start + length, 1);
+  }
+
+  // Unbacked start handling!
+
   // Bounds check without converting start:
   // - If start < 0: need (start + cur_size) + length <= cur_size, i.e., start +
   // length <= 0
@@ -1727,11 +1750,8 @@ Tensor narrow_symint(
       cur_size,
       ").");
 
-  if (TORCH_GUARD_OR_FALSE(start.sym_ge(0).sym_or(end.sym_ne(0)))) {
+  if (TORCH_GUARD_OR_FALSE(end.sym_ne(0))) {
     return at::slice_symint(self, dim, start, end, 1);
-  } else if (TORCH_GUARD_OR_FALSE(start.sym_lt(0))) {
-    // Avoid the complex symbolic expressions path for non-unbacked.
-    return at::slice_symint(self, dim, start + cur_size, end + cur_size, 1);
   } else {
     // Cannot statically determine the condition due to unbacked.
     // This is an interesting situation; when start is negative and
@@ -1764,8 +1784,8 @@ Tensor narrow_tensor_symint(
       start.dim() == 0 &&
           isIntegralType(start.scalar_type(), /*includeBool=*/false),
       "start must be an 0-dim integral Tensor.");
-  int64_t st = start.item<int64_t>();
-  return at::narrow_symint(self, dim, c10::SymInt(st), std::move(length));
+  c10::SymInt st = start.item().toSymInt();
+  return at::narrow_symint(self, dim, std::move(st), std::move(length));
 }
 
 std::
@@ -4790,7 +4810,7 @@ std::vector<Tensor> unflatten_dense_tensors(
     // This can avoid the unflattened empty tensor to share the same storage
     // with other unflatten tensors.
     if (numel == 0) {
-      outputs.push_back(at::empty({0}, flat.options()));
+      outputs.push_back(at::empty(tensor.sizes(), flat.options()));
     } else {
       outputs.push_back(flat.narrow(0, offset, numel).view(tensor.sizes()));
       offset += numel;
@@ -4822,7 +4842,7 @@ at::Tensor clone_preserve_strides(const at::Tensor& self) {
   if (at::has_internal_overlap(self) == at::MemOverlap::Yes) {
     return self.clone();
   }
-  auto dtype_size = self.dtype().itemsize();
+  auto dtype_size = c10::SymInt(self.dtype().itemsize());
   auto nbytes = self.storage().sym_nbytes();
   TORCH_INTERNAL_ASSERT(nbytes % dtype_size == 0);
   auto numel = nbytes / dtype_size;

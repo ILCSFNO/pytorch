@@ -945,9 +945,12 @@ class TestFunctionalIterDataPipe(TestCase):
                 thing=getattr(input_dp, dp_funcname), forceload=True
             )
 
-            assert f"(functional name: ``{dp_funcname}``)" in docstring
-            assert "Args:" in docstring
-            assert "Example:" in docstring or "Examples:" in docstring
+            if f"(functional name: ``{dp_funcname}``)" not in docstring:
+                raise AssertionError(f"expected functional name in docstring for {dp_funcname}")
+            if "Args:" not in docstring:
+                raise AssertionError(f"expected 'Args:' in docstring for {dp_funcname}")
+            if "Example:" not in docstring and "Examples:" not in docstring:
+                raise AssertionError(f"expected 'Example:' or 'Examples:' in docstring for {dp_funcname}")
 
     def test_iterable_wrapper_datapipe(self):
         input_ls = list(range(10))
@@ -1136,7 +1139,7 @@ class TestFunctionalIterDataPipe(TestCase):
                     )
                 break
         with warnings.catch_warnings(record=True) as wa:
-            for i, (n1, n2) in enumerate(zip(dp1, dp2)):
+            for n1, n2 in zip(dp1, dp2):
                 output1.append(n1)
                 output2.append(n2)
             self.assertEqual(len(wa), 1)
@@ -2182,9 +2185,12 @@ class TestFunctionalMapDataPipe(TestCase):
             docstring = pydoc.render_doc(
                 thing=getattr(input_dp, dp_funcname), forceload=True
             )
-            assert f"(functional name: ``{dp_funcname}``)" in docstring
-            assert "Args:" in docstring
-            assert "Example:" in docstring or "Examples:" in docstring
+            if f"(functional name: ``{dp_funcname}``)" not in docstring:
+                raise AssertionError(f"expected functional name in docstring for {dp_funcname}")
+            if "Args:" not in docstring:
+                raise AssertionError(f"expected 'Args:' in docstring for {dp_funcname}")
+            if "Example:" not in docstring and "Examples:" not in docstring:
+                raise AssertionError(f"expected 'Example:' or 'Examples:' in docstring for {dp_funcname}")
 
     def test_sequence_wrapper_datapipe(self):
         seq = list(range(10))

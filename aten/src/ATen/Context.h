@@ -174,6 +174,12 @@ class TORCH_API Context {
   static long versionCuDNN() {
     return detail::getCUDAHooks().versionCuDNN();
   }
+  static long versionRuntimeCuDNN() {
+    return detail::getCUDAHooks().versionRuntimeCuDNN();
+  }
+  static long versionCuDNNFrontend() {
+    return detail::getCUDAHooks().versionCuDNNFrontend();
+  }
   static bool hasCuSOLVER() {
     return detail::getCUDAHooks().hasCuSOLVER();
   }
@@ -218,6 +224,10 @@ class TORCH_API Context {
     return detail::getCUDAHooks().nvrtc();
   }
 
+  static const at::xpu::LevelZero& getLevelZero() {
+    return detail::getXPUHooks().level_zero();
+  }
+
   static bool setFlushDenormal(bool on);
 
   // NB: This method is *purely* whether or not a user requested
@@ -257,6 +267,9 @@ class TORCH_API Context {
 
   void setSDPUseFlash(bool /*e*/);
   bool userEnabledFlashSDP() const;
+
+  void setSDPUseFA3(bool /*e*/);
+  bool userEnabledFA3SDP() const;
 
   void setSDPUseMemEfficient(bool /*e*/);
   bool userEnabledMemEfficientSDP() const;
@@ -376,6 +389,7 @@ class TORCH_API Context {
       bool allow_splitk = true);
   bool allowFP16AccumulationCuBLAS() const;
   void setAllowFP16AccumulationCuBLAS(bool /*b*/);
+  bool rocmAllowGroupGemmCk() const;
 
   // Matmuls can use a so-called "persistent" kernel which launches one CUDA
   // block for each SM on the GPU, and each block then iterates over multiple
@@ -393,8 +407,9 @@ class TORCH_API Context {
   void setQEngine(at::QEngine e);
   static const std::vector<at::QEngine>& supportedQEngines();
   static bool isXNNPACKAvailable();
-  void setCheckSparseTensorInvariants(bool e);
-  bool checkSparseTensorInvariants() const;
+  void setCheckSparseTensorInvariants(std::optional<bool> e);
+  std::optional<bool> checkSparseTensorInvariants(
+      bool warn_when_uninitialized = false) const;
   // This method is used to release the original weight after pre-packing.
   // It should be called once before loading/running the model.
   // NB: By default it is set to true for mobile builds.
@@ -403,6 +418,9 @@ class TORCH_API Context {
 
   void setDisplayVmapFallbackWarnings(bool enabled);
   bool areVmapFallbackWarningsEnabled() const;
+
+  void setWarnOnAccumulateGradStreamMismatch(bool enabled);
+  bool warnOnAccumulateGradStreamMismatch() const;
 
   bool isDefaultMobileCPUAllocatorSet();
   void setDefaultMobileCPUAllocator();
@@ -452,6 +470,7 @@ class TORCH_API Context {
       at::SDPBackend::cudnn_attention,
       at::SDPBackend::overrideable};
   bool enabled_flashSDP = true;
+  bool enabled_fa3SDP = false;
   bool enabled_mem_efficientSDP = true;
   bool enabled_mathSDP = true;
   bool enabled_cudnnSDP = true;
@@ -494,8 +513,9 @@ class TORCH_API Context {
   bool release_original_weights = false;
 #endif
   bool display_vmap_fallback_warnings_ = false;
+  bool warn_on_accumulate_grad_stream_mismatch_ = true;
   std::atomic<at::QEngine> quantized_engine = at::QEngine::NoQEngine;
-  bool enable_sparse_tensor_invariant_checks = false;
+  std::optional<bool> enable_sparse_tensor_invariant_checks = std::nullopt;
   bool allow_fp16_reduction_cpu = false;
 
   using Key = std::pair<Float32Backend, Float32Op>;

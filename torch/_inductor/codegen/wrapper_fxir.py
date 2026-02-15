@@ -4,8 +4,8 @@ import logging
 import operator
 import textwrap
 from collections import Counter
-from collections.abc import Sequence
-from typing import Any, Callable, Optional, Union
+from collections.abc import Callable, Sequence
+from typing import Any, Optional, Union
 
 import sympy
 
@@ -50,8 +50,6 @@ from .common import (
 from .wrapper import (
     AllocateLine,
     BufferLike,
-    CommBufferAllocateLine,
-    CommBufferFreeLine,
     CommentLine,
     ConditionalLine,
     DynamicScalarLine,
@@ -187,7 +185,7 @@ class WrapperFxCodegen(PythonWrapperCodegen):
         """
         Get the input nodes corresponding to FX graph placeholders.
         """
-        # pyrefly: ignore [missing-argument]
+
         if V.aot_compilation and not self.is_subgraph:
             # AOT graphs must match the signature of the input module.
             return {
@@ -212,7 +210,6 @@ class WrapperFxCodegen(PythonWrapperCodegen):
             graph_inputs=self.get_fx_graph_inputs(),
             graph_outputs=self.get_graph_outputs(),
             subgms=self.subgms,
-            # pyrefly: ignore [missing-argument]
             is_subgraph=self.is_subgraph,
         ).generate()
 
@@ -678,6 +675,7 @@ class FxConverter:
         assert name not in V.graph.removed_buffers
 
         device = buffer.get_device()
+        assert device
         dtype = buffer.get_dtype()
         shape = self._generate_sym_nodes(buffer.get_size())
         stride = self._generate_sym_nodes(buffer.get_stride())
@@ -685,7 +683,7 @@ class FxConverter:
         node = self.gm.graph.call_function(
             torch.empty_strided,
             args=(shape, stride),
-            kwargs={"dtype": dtype, "device": device},
+            kwargs={"dtype": dtype, "device": device.type},
         )
         assert name
         node.name = name
@@ -927,11 +925,11 @@ class FxConverter:
         # Does nothing.
 
     def _generate_comm_buffer_allocate(self, line: WrapperLine) -> None:
-        assert isinstance(line, CommBufferAllocateLine)
+        assert isinstance(line, AllocateLine) and line.comm_buffer
         raise NotImplementedError("Comm buffer allocation is not yet supported")
 
     def _generate_comm_buffer_free(self, line: WrapperLine) -> None:
-        assert isinstance(line, CommBufferFreeLine)
+        assert isinstance(line, FreeIfNotReusedLine) and line.comm_buffer
         self._free(line.node)
 
     def _generate_triton_call(self, line: WrapperLine) -> None:
@@ -949,7 +947,9 @@ class FxConverter:
             from triton.runtime import driver
 
             log.info("Autotuning Triton kernel %s at compile time.", kernel_name)
+
             device = driver.active.get_current_device()
+
             stream = driver.active.get_current_stream(device)
 
             def node_to_tuning_arg(arg: Any) -> Any:
@@ -958,23 +958,30 @@ class FxConverter:
                 for dynamic shapes.
                 """
 
-                def to_size_hint(arg: Any) -> Any:
+                def to_size_hint_sympy_int(arg: Union[sympy.Expr, int]) -> int:
                     if len(free_unbacked_symbols(arg)) > 0:
                         # NYI: tuning args require backed symints.
                         raise UnbackedSymintsError
-                    return pytree.tree_map(V.graph.sizevars.size_hint, arg)
+                    return V.graph.sizevars.size_hint(arg)
+
+                def to_size_hint_list(arg: list[Union[torch.SymInt, int]]) -> list[int]:
+                    args_sympy = [
+                        x.node.expr if isinstance(x, torch.SymInt) else x for x in arg
+                    ]
+                    return pytree.tree_map(to_size_hint_sympy_int, args_sympy)
 
                 if not isinstance(arg, torch.fx.Node):
-                    return to_size_hint(arg)
+                    return to_size_hint_sympy_int(arg)
 
                 fake = arg.meta["val"]
                 return torch.empty_strided(
-                    to_size_hint(fake.shape),
-                    to_size_hint(fake.stride()),
+                    to_size_hint_list(fake.shape),
+                    to_size_hint_list(fake.stride()),
                     dtype=fake.dtype,
                     device=device,
                 ).zero_()
 
+            # call args can be fx nodes or sympy expressions or integers!
             arg_values = [node_to_tuning_arg(arg) for arg in call_args]
             tuner.run(*arg_values, stream=stream)
 
@@ -1101,7 +1108,11 @@ class FxConverter:
 
         # Get the result buffer.
         # Some kernels write to a pre-existing output tensor via the "out" kwarg.
-        kwargs = kernel.kwargs.copy()
+        # Materialize any IR nodes in kwargs to FX nodes (e.g., TensorBox -> Tensor).
+        kwargs = {
+            k: self._generate_buffer(v) if isinstance(v, ir.IRNode) else v
+            for k, v in kernel.kwargs.items()
+        }
 
         result_buffer: Optional[str] = None
         if isinstance(kernel, ir.ExternKernelOut):
